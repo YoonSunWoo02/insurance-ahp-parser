@@ -12,7 +12,9 @@ venv/
 env/
 
 # ── 파싱 산출물 (생성물) ──
-data/parsed/
+# 폴더 자체는 유지(.gitkeep), 안의 JSON 산출물만 무시
+data/parsed/*
+!data/parsed/.gitkeep
 output/
 toxic_result.json
 *_result.json
