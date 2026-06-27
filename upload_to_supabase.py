@@ -140,9 +140,52 @@ def upsert_product(client, source_pdf: str, insurer: str, category: str, raw_tex
     return product_id
 
 
+# ── amount null 후처리 ───────────────────────────────────────
+def _fill_missing_amounts(results: list[dict]) -> int:
+    """같은 coverage_name 그룹 내에서 amount가 있는 항목의 값으로
+    같은 그룹의 null/빈 항목을 채워넣는다.
+
+    예) 제3조 '상해급여' amount=null, 제6조 '상해급여' amount='5천만원'
+        → 제3조 '상해급여' amount='5천만원' 으로 보정.
+
+    coverage 딕셔너리의 'amount' 값을 in-place로 수정하고, 채운 건수를 반환한다.
+    """
+    # 1) 같은 coverage_name 끼리 그룹화
+    groups: dict[str, list[dict]] = {}
+    for article in results:
+        for cov in article.get("coverages", []):
+            name = cov.get("coverage_name")
+            if name is None:
+                continue
+            groups.setdefault(name, []).append(cov)
+
+    filled = 0
+    # 2) 그룹 내에 amount가 있으면 같은 그룹의 null 항목에 채워넣기
+    for name, covs in groups.items():
+        donor = next(
+            (c.get("amount") for c in covs
+             if c.get("amount") and str(c.get("amount")).lower() != "null"),
+            None,
+        )
+        if donor is None:
+            continue
+        for c in covs:
+            amt = c.get("amount")
+            if not amt or str(amt).lower() == "null":
+                c["amount"] = donor
+                filled += 1
+
+    # 3) 로그 출력
+    print(f"[보장] amount 후처리: {filled}건 채움")
+    return filled
+
+
 # ── 2단계: product_coverage 적재 ─────────────────────────────
 def insert_coverages(client, product_id: str, results: list[dict]) -> int:
     """result.json의 results 배열에서 보장 항목을 추출해 적재한다."""
+    # DB 적재 전 amount null 후처리 (같은 coverage_name 그룹 내 값 채움)
+    _fill_missing_amounts(results)
+
     rows = []
     for article in results:
         for cov in article.get("coverages", []):
