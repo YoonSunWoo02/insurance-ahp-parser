@@ -1,0 +1,30 @@
+# ── 환경변수 / 비밀키 (절대 커밋 금지) ──
+.env
+.env.local
+.env.*.local
+
+# ── 파이썬 캐시 ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── 파싱 산출물 (생성물) ──
+data/parsed/
+output/
+toxic_result.json
+*_result.json
+*_toxic.json
+*_compare.json
+amount_parse_comparison.json
+
+# ── 원본 약관 PDF (대용량·저작권) ──
+data/raw_pdfs/*.pdf
+
+# ── OS / 에디터 ──
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

@@ -1,0 +1,281 @@
+"""독소조항(계약자에게 불리한 조항) 탐지 모듈.
+
+2단계로 동작한다.
+    1단계 - 키워드 기반 후보 선별 (비용 없음):
+        면책/지급제외·제한조건·감액/삭감·기간제한·고지/통지 의무 관련
+        키워드가 포함된 조항만 후보로 추린다. 노이즈 제목은 제외.
+    2단계 - GPT 정밀 판단:
+        후보 조항만 GPT에 넘겨 실제 독소조항 여부를 판단한다.
+        독소조항이 없는 조항은 결과에서 제외한다.
+
+GPT 모델/클라이언트는 parser/gpt_classifier.py의 설정을 재사용한다.
+
+메인 함수: detect_toxic_clauses(articles)
+    - extract_articles() 반환값(list[Article])을 그대로 받음
+    - 독소조항이 1개 이상 발견된 조항만 리스트로 반환
+"""
+
+import json
+import sys
+
+from parser.pdf_extractor import Article
+from parser.gpt_classifier import (
+    MODEL,
+    REQUEST_TIMEOUT,
+    SYSTEM_PROMPT,
+    _get_client,
+)
+from validator.verifier import _normalize as _norm_text, _contains as _in_source
+
+
+# ---------------------------------------------------------------------------
+# 1단계: 키워드 사전
+# ---------------------------------------------------------------------------
+# 카테고리별 독소조항 후보 키워드. 하나라도 포함되면 후보로 선별한다.
+TOXIC_KEYWORDS: dict[str, list[str]] = {
+    "면책/지급제외": [
+        "지급하지 않", "보상하지 않", "면책", "제외한다",
+        "해당하지 않", "적용하지 않", "보험금을 드리지 않", "보장하지 않",
+    ],
+    "제한조건": [
+        "다만,", "단,", "단서", "경우에 한하여", "경우에만",
+        "한도 내에서", "초과하는 경우", "미만인 경우",
+    ],
+    "감액/삭감": [
+        "감액", "삭감", "차감", "공제", "본인부담", "자기부담",
+    ],
+    "기간제한": [
+        "면책기간", "대기기간", "감액기간", "이내 발생", "경과 후",
+        "이후부터", "계약일로부터", "부활일로부터",
+    ],
+    "고지/통지의무": [
+        "알릴 의무", "고지의무", "통지의무", "위반한 경우",
+        "사실과 다른 경우", "직업 변경", "직무 변경",
+    ],
+}
+
+# 독소조항 탐지에서 제외할 노이즈 조항 제목
+NOISE_TITLE_KEYWORDS = [
+    "용어의 정의", "예금자보호", "준용규정", "관할법원",
+    "분쟁조정", "개인신용정보", "주소변경", "계약의 성립",
+]
+
+# 본문이 이 길이 미만이면 목차(TOC) stub 등으로 보고 후보에서 제외한다.
+# (약관 PDF는 목차 항목도 "제N조(제목)" 형태라 헤더로 잡히지만 본문이 거의 없음)
+MIN_BODY_LENGTH = 50
+
+# source_quote가 이 길이 미만이면 근거가 빈약한 것으로 보고 신뢰 불가 처리한다.
+MIN_QUOTE_LENGTH = 15
+
+
+def _is_noise_title(title: str) -> bool:
+    """독소조항과 무관한 노이즈 제목인지."""
+    return any(kw in title for kw in NOISE_TITLE_KEYWORDS)
+
+
+def matched_keywords(text: str) -> list[str]:
+    """텍스트에 포함된 독소조항 키워드 목록을 반환한다."""
+    found: list[str] = []
+    for keywords in TOXIC_KEYWORDS.values():
+        for kw in keywords:
+            if kw in text:
+                found.append(kw)
+    return found
+
+
+def is_candidate(article: Article) -> bool:
+    """조항이 독소조항 후보인지 (키워드 포함 & 노이즈 제목·목차 stub 아님)."""
+    if _is_noise_title(article.title):
+        return False
+    if len(article.body) < MIN_BODY_LENGTH:
+        return False
+    return bool(matched_keywords(article.full_text()))
+
+
+# ---------------------------------------------------------------------------
+# 2단계: GPT 정밀 판단
+# ---------------------------------------------------------------------------
+USER_TEMPLATE = """다음 보험 약관 조항에서 계약자(가입자)에게 불리하게 작용할 수 있는
+독소조항을 찾아라. 면책/지급제외, 제한조건, 감액/삭감, 기간제한,
+고지·통지 의무 위반의 효과 등 계약자에게 불리한 내용만 추출한다.
+
+불리한 내용이 없으면 빈 배열로 답한다.
+원문에 없는 내용은 절대 지어내지 말고, source_quote는 원문을 그대로 인용한다.
+
+[조항 제목]
+{title}
+
+[조항 원문]
+{body}
+
+[출력 JSON 스키마]
+{{
+  "toxic_clauses": [
+    {{
+      "clause_summary": "독소조항 핵심 요약",
+      "reason": "계약자에게 불리한 이유",
+      "severity": "높음 | 중간 | 낮음",
+      "source_quote": "근거가 된 원문 문장 (원문 그대로)"
+    }}
+  ]
+}}
+
+반드시 위 스키마의 JSON만 출력하라."""
+
+
+def detect_in_article(article: Article, client=None) -> list[dict]:
+    """조항 1개를 GPT로 분석해 독소조항 목록을 반환한다.
+
+    독소조항이 없으면 빈 리스트. API/파싱 오류 시에도 빈 리스트를 반환하고
+    경고를 stderr로 남긴다(해당 조항만 건너뜀).
+    """
+    client = client or _get_client()
+    user_msg = USER_TEMPLATE.format(
+        title=article.title or "(제목 없음)",
+        body=article.full_text(),
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        content = resp.choices[0].message.content or "{}"
+        data = json.loads(content)
+        return data.get("toxic_clauses", []) or []
+    except Exception as e:  # API 오류/JSON 파싱 오류 모두 포착
+        print(f"      → 건너뜀 (오류: {e})", file=sys.stderr)
+        return []
+
+
+def _filter_clauses(clauses: list[dict], source_text: str) -> tuple[list[dict], int, int]:
+    """GPT가 낸 독소조항을 후처리로 검증한다.
+
+    제외 기준:
+        1) source_quote가 MIN_QUOTE_LENGTH(15자) 미만 → 근거 빈약, 신뢰 불가
+        2) source_quote가 원문에 실제로 없음 → 환각/오탐 (verifier 대조 로직 재사용)
+
+    반환: (남은_clauses, 짧은인용_제외수, 원문불일치_제외수)
+    """
+    src_norm = _norm_text(source_text)
+    kept: list[dict] = []
+    excluded_short = 0
+    excluded_not_in_source = 0
+    for c in clauses:
+        quote = (c.get("source_quote") or "").strip()
+        if len(quote) < MIN_QUOTE_LENGTH:
+            excluded_short += 1
+            continue
+        if not _in_source(src_norm, quote):
+            excluded_not_in_source += 1
+            continue
+        kept.append(c)
+    return kept, excluded_short, excluded_not_in_source
+
+
+def detect_toxic_clauses(articles: list[Article]) -> tuple[list[dict], dict]:
+    """전체 조항 중 후보만 GPT로 판단해 독소조항이 있는 조항만 반환한다.
+
+    GPT 결과는 후처리 필터(짧은 인용 제외 + 원문 대조)로 검증한다.
+
+    반환: (results, filter_stats)
+        results: [
+          {
+            "article_number": N,
+            "article_title": "...",
+            "toxic_clauses": [ {clause_summary, reason, severity, source_quote}, ... ]
+          }, ...
+        ]
+        filter_stats: {"excluded_short_quote": x, "excluded_not_in_source": y}
+    """
+    candidates = [a for a in articles if is_candidate(a)]
+    print(
+        f"전체 {len(articles)}개 조항 중 독소조항 후보 {len(candidates)}개 GPT 판단",
+        file=sys.stderr,
+    )
+
+    client = _get_client()
+    total = len(candidates)
+    results: list[dict] = []
+    excluded_short_total = 0
+    excluded_not_in_source_total = 0
+    for idx, art in enumerate(candidates, start=1):
+        print(
+            f"[{idx}/{total}] 제{art.number}조 '{art.title}' 독소조항 판단 중...",
+            file=sys.stderr,
+        )
+        raw = detect_in_article(art, client=client)
+        if not raw:
+            continue
+        kept, ex_short, ex_src = _filter_clauses(raw, art.full_text())
+        excluded_short_total += ex_short
+        excluded_not_in_source_total += ex_src
+        if kept:
+            results.append(
+                {
+                    "article_number": art.number,
+                    "article_title": art.title,
+                    "toxic_clauses": kept,
+                }
+            )
+
+    filter_stats = {
+        "excluded_short_quote": excluded_short_total,
+        "excluded_not_in_source": excluded_not_in_source_total,
+    }
+    print(
+        f"      → 독소조항 발견 조항 {len(results)}개 "
+        f"(필터 제외: 짧은인용 {excluded_short_total}건, "
+        f"원문불일치 {excluded_not_in_source_total}건)",
+        file=sys.stderr,
+    )
+    return results, filter_stats
+
+
+def summarize(toxic_results: list[dict], filter_stats: dict | None = None) -> dict:
+    """탐지 결과 요약을 만든다 (총 독소조항 수, 영향 조항 수, 필터 제외 수)."""
+    total = sum(len(r["toxic_clauses"]) for r in toxic_results)
+    summary = {
+        "total_toxic_clauses": total,
+        "affected_articles": len(toxic_results),
+    }
+    if filter_stats:
+        summary["excluded_short_quote"] = filter_stats.get("excluded_short_quote", 0)
+        summary["excluded_not_in_source"] = filter_stats.get(
+            "excluded_not_in_source", 0
+        )
+        summary["total_excluded"] = (
+            summary["excluded_short_quote"] + summary["excluded_not_in_source"]
+        )
+    return summary
+
+
+if __name__ == "__main__":
+    from parser.pdf_extractor import extract_articles
+
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except ImportError:
+        pass
+
+    if len(sys.argv) < 2:
+        print("사용법: python toxic_detector.py <pdf_경로>")
+        sys.exit(1)
+
+    arts = extract_articles(sys.argv[1])
+    toxic, stats = detect_toxic_clauses(arts)
+    print(
+        json.dumps(
+            {"toxic_summary": summarize(toxic, stats), "toxic_clauses": toxic},
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
