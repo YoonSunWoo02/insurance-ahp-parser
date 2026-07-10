@@ -210,6 +210,29 @@ def test_enum_merged_into_result():
 
 # ── 회귀: 기존 postprocess 로직이 깨지지 않았는지 ────────────────
 
+def test_sanitize_amounts():
+    print("[정밀도1] 비금액 문장 amount 정리")
+    from postprocess import sanitize_amounts
+    res = [{"coverages": [
+        {"coverage_name": "상해입원의료비", "amount": "연간 보험가입금액의 한도 내에서 보상합니다."},
+        {"coverage_name": "상해외래", "amount": "년간 방문 180회 한도"},
+        {"coverage_name": "질병입원", "amount": "5,000만원"},          # 유지
+        {"coverage_name": "1일한도", "amount": "1일 평균금액 10만원"},   # 유지(만원 포함)
+        {"coverage_name": "본인부담", "amount": "70%"},                # 유지(%)
+        {"coverage_name": "없음", "amount": None},                     # 이미 null
+    ]}]
+    n = sanitize_amounts(res)
+    covs = res[0]["coverages"]
+    check(n == 2, f"비금액 문장 2건만 정리 (실제 {n})")
+    check(covs[0]["amount"] is None, "'…한도 내에서 보상합니다' → null")
+    check(covs[1]["amount"] is None, "'년간 방문 180회 한도' → null")
+    check(covs[2]["amount"] == "5,000만원", "'5,000만원' 유지")
+    check(covs[3]["amount"] == "1일 평균금액 10만원", "'1일 평균금액 10만원'(만원 포함) 유지")
+    check(covs[4]["amount"] == "70%", "'70%' 유지")
+    # 멱등성: 두 번째 실행은 0건
+    check(sanitize_amounts(res) == 0, "sanitize 멱등(2회차 0건)")
+
+
 def test_postprocess_regression():
     print("[회귀] postprocess 저신뢰 무효화 + 채우기 + dedup + 멱등")
     res = [{"coverages": [
@@ -239,6 +262,7 @@ def main() -> int:
         test_enum_valid_value_untouched,
         test_coverage_type_combo_allowed,
         test_enum_merged_into_result,
+        test_sanitize_amounts,
         test_postprocess_regression,
     ):
         t()

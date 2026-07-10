@@ -3,16 +3,18 @@
 verifier까지 끝난 results 배열을 받아 DB/JSON에 내보내기 전 정제한다.
 main.py(JSON 저장 전)와 upload_to_supabase.py(DB 적재 전)가 공유한다.
 
-세 단계로 구성되며 **순서가 중요하다**:
+네 단계로 구성되며 **순서가 중요하다**:
     1) clear_low_confidence_amounts — 원문 대조에 실패한 금액을 null로 지운다.
-    2) fill_missing_amounts         — 같은 coverage_name 그룹의 신뢰 가능한 금액으로 null을 채운다.
-    3) dedup_coverages              — 완전히 동일한 보장이 여러 조항에 반복된 것을 1건으로 줄인다.
+    2) sanitize_amounts             — 금액이 아닌 문장/한도 문구를 null로 지운다.
+    3) fill_missing_amounts         — 같은 coverage_name 그룹의 신뢰 가능한 금액으로 null을 채운다.
+    4) dedup_coverages              — 완전히 동일한 보장이 여러 조항에 반복된 것을 1건으로 줄인다.
 
-1) → 2) 순서를 지켜야 환각 금액이 2)에서 donor가 되어 같은 그룹으로 전파되는 것을 막을 수 있다.
-2) → 3) 순서를 지켜야 amount가 채워진 뒤 중복 판정이 이뤄진다. (채우기 전이면 amount=None인
-항목과 amount가 있는 항목이 서로 다른 보장으로 남아 중복이 제거되지 않는다.)
+1)·2) → 3) 순서를 지켜야 환각/비금액 문자열이 3)에서 donor가 되어 같은 그룹으로
+전파되는 것을 막을 수 있다. 3) → 4) 순서를 지켜야 amount가 채워진 뒤 중복 판정이
+이뤄진다(채우기 전이면 amount=None 항목과 값 있는 항목이 서로 달라 중복이 안 잡힌다).
 """
 
+import re
 import sys
 
 # 이 점수 미만이면 verifier가 원문 대조에 실패한 것으로 보고 금액을 신뢰하지 않는다.
@@ -30,6 +32,31 @@ def _iter_coverages(results: list[dict]):
 def _is_blank_amount(amount) -> bool:
     """amount가 비어있는(없는) 값인지."""
     return not amount or str(amount).strip().lower() == "null"
+
+
+# 금액/비율 신호: 숫자 + 화폐단위(억/천만/백만/만/원) 또는 백분율.
+# 이 신호가 전혀 없는 값(예: "연간 보험가입금액의 한도 내에서 보상합니다",
+# "년간 방문 180회 한도")은 금액이 아니라 한도 서술 문장이므로 amount로 인정하지 않는다.
+_MONEY_SIGNAL = re.compile(r"\d[\d,]*\s*(?:억|천만|백만|만|원)|\d+\s*%")
+
+
+def sanitize_amounts(results: list[dict]) -> int:
+    """금액 표현이 아닌 amount 값을 None으로 지운다(비금액 문장 정리).
+
+    실손 보장 조항은 금액을 별도 '가입금액 한도' 조항에 두고 본문에는
+    "가입금액 한도 내에서 보상"이라고만 쓰는 경우가 많다. GPT는 원문에 충실해
+    이 문장을 amount에 담지만, 이는 숫자가 아니므로 정리한다. 숫자 화폐 표현이
+    하나라도 있으면(예: "1일 평균금액 10만원") 유지한다.
+
+    지운 건수를 반환한다.
+    """
+    cleared = 0
+    for cov in _iter_coverages(results):
+        amt = cov.get("amount")
+        if not _is_blank_amount(amt) and not _MONEY_SIGNAL.search(str(amt)):
+            cov["amount"] = None
+            cleared += 1
+    return cleared
 
 
 def _score(cov: dict) -> float:
@@ -152,7 +179,7 @@ def postprocess(
     min_confidence: int = MIN_CONFIDENCE,
     verbose: bool = True,
 ) -> dict[str, int]:
-    """정제 3단계를 순서대로 적용하고 통계를 반환한다. results는 in-place로 수정된다.
+    """정제 4단계를 순서대로 적용하고 통계를 반환한다. results는 in-place로 수정된다.
 
     여러 번 실행해도 결과가 같다(멱등). JSON 저장 전과 DB 적재 전 모두에서
     안전하게 호출할 수 있다.
@@ -162,6 +189,7 @@ def postprocess(
     before = count_coverages(results)
 
     cleared = clear_low_confidence_amounts(results, min_confidence)
+    sanitized = sanitize_amounts(results)
     filled = fill_missing_amounts(results)
     removed = dedup_coverages(results)
 
@@ -169,8 +197,9 @@ def postprocess(
 
     if verbose:
         print(f"[후처리] 신뢰도 {min_confidence} 미만 금액 무효화: {cleared}건", file=sys.stderr)
+        print(f"[후처리] 비금액 문자열 정리: {sanitized}건", file=sys.stderr)
         print(f"[후처리] amount 후처리: {filled}건 채움", file=sys.stderr)
         print(f"[보장] 중복 제거: {before}건 → {after}건", file=sys.stderr)
 
-    return {"cleared": cleared, "filled": filled, "removed": removed,
-            "before": before, "after": after}
+    return {"cleared": cleared, "sanitized": sanitized, "filled": filled,
+            "removed": removed, "before": before, "after": after}
