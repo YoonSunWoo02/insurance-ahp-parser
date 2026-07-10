@@ -37,22 +37,43 @@ ALLOWED_ENUM_VALUES: dict[str, set[str]] = {
     "benefit_type": {"급여", "비급여", "급여+비급여", "불명"},
 }
 
+# 이 필드는 "입원 | 통원"처럼 여러 값을 조합해 반환하는 것이 정당하다.
+# 단, GPT가 선택지 문자열 전체("입원 | 통원 | 수술 | 불명")를 반환한 버그와는
+# 구분해야 한다 → 조합에 "불명"이 섞여 있으면(불명은 단독 전용) 버그로 보고 무효 처리.
+PIPE_COMBO_FIELDS = {"coverage_type"}
+
 # enum 필드 1개가 유효하지 않을 때마다 신뢰도에서 깎는 점수
 ENUM_INVALID_PENALTY = 10
+
+
+def _is_valid_enum(field: str, val, allowed: set[str]) -> bool:
+    """enum 필드 값이 유효한지. coverage_type은 허용값 '|' 조합도 인정한다."""
+    if not isinstance(val, str):
+        return False
+    v = val.strip()
+    if v in allowed:
+        return True
+    # 조합 허용 필드: "입원 | 통원"처럼 모든 조각이 허용값(불명 제외)이면 인정.
+    # 조합에 "불명"이 있으면 선택지 문자열 통째 반환(버그)이므로 인정하지 않는다.
+    if field in PIPE_COMBO_FIELDS and "|" in v:
+        parts = [p.strip() for p in v.split("|")]
+        real_values = allowed - {"불명"}
+        return len(parts) >= 2 and all(p in real_values for p in parts)
+    return False
 
 
 def _validate_enum_fields(coverage: dict) -> tuple[dict, dict, int]:
     """GPT enum 필드(contract_type/coverage_type/benefit_type)의 유효성을 검사한다.
 
     허용값에 정확히 속하지 않으면 해당 필드를 "불명"으로 치환한다.
+    (coverage_type만 "입원 | 통원" 같은 허용값 조합을 예외로 인정한다.)
     반환: (치환된 필드 dict, {필드명+"_valid": bool} 검증결과, 총 감점).
     """
     corrected: dict[str, str] = {}
     checks: dict[str, bool] = {}
     penalty = 0
     for field, allowed in ALLOWED_ENUM_VALUES.items():
-        val = coverage.get(field)
-        valid = isinstance(val, str) and val.strip() in allowed
+        valid = _is_valid_enum(field, coverage.get(field), allowed)
         checks[f"{field}_valid"] = valid
         if not valid:
             corrected[field] = "불명"

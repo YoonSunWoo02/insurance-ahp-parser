@@ -157,6 +157,35 @@ def test_enum_valid_value_untouched():
           f"유효 enum은 감점 0, 무효 1건은 -10 (valid {r_valid['confidence']} vs invalid {r_invalid['confidence']})")
 
 
+def test_coverage_type_combo_allowed():
+    print("[작업2-완화] coverage_type 조합값 인정 vs 선택지 문자열 버그 구분")
+    src = REAL_COVERAGE_BODY
+    base = {
+        "coverage_name": "상해급여",
+        "amount": "5,000만원",
+        "payment_condition": "입원과 통원을 합산하여 보상",
+        "contract_type": "주계약",
+        "benefit_type": "급여",
+        "source_quote": "입원과 통원을 합산하여 5,000만원 이내에서 보상",
+    }
+    # 정당한 조합값 → 유지, 감점 없음
+    combo = verify_coverage(dict(base, coverage_type="입원 | 통원"), src)
+    check(combo["checks"]["coverage_type_valid"] is True,
+          "coverage_type='입원 | 통원' → 유효(조합값 인정)")
+    check("coverage_type" not in combo,
+          "유효 조합값은 '불명'으로 치환되지 않음(원본 유지)")
+    # 선택지 문자열 전체(불명 포함) → 버그로 간주해 여전히 무효
+    literal = verify_coverage(dict(base, coverage_type="입원 | 통원 | 수술 | 불명"), src)
+    check(literal["checks"]["coverage_type_valid"] is False,
+          "coverage_type='입원 | 통원 | 수술 | 불명'(선택지 통째) → 무효")
+    check(literal["coverage_type"] == "불명",
+          "선택지 문자열 버그는 여전히 '불명'으로 치환")
+    # 조합에 허용 안 되는 값이 섞이면 무효
+    bad = verify_coverage(dict(base, coverage_type="입원 | 응급"), src)
+    check(bad["checks"]["coverage_type_valid"] is False,
+          "coverage_type='입원 | 응급'(허용 외 조각) → 무효")
+
+
 def test_enum_merged_into_result():
     print("[작업2] verify_result 병합 시 치환값이 최종 보장에 반영되는지")
     art = make_article(3, "보장종목별 보상내용", REAL_COVERAGE_BODY)
@@ -208,6 +237,7 @@ def main() -> int:
         test_law_articles_excluded_from_candidates,
         test_enum_invalid_value_coerced,
         test_enum_valid_value_untouched,
+        test_coverage_type_combo_allowed,
         test_enum_merged_into_result,
         test_postprocess_regression,
     ):
