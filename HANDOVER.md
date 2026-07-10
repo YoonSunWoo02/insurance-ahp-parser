@@ -27,18 +27,19 @@ python upload_to_supabase.py --list
 python upload_to_supabase.py --result "data/parsed/약관_result.json" --insurer 삼성화재 --category 실손
 ```
 
-## 3. 파이프라인 (5단계)
+## 3. 파이프라인 (4단계)
 
 ```
-PDF → pdf_extractor → rule_extractor → gpt_classifier(1차) → gpt_classifier(2차) → verifier → JSON
-      조항 분리        규칙 후보         GPT 보장여부 판단     GPT 상세 추출        원문대조·신뢰도
+PDF → pdf_extractor → rule_extractor → gpt_classifier → verifier → JSON
+      조항 분리        규칙 기반 선별    GPT 상세 추출    원문대조·신뢰도
 ```
 
 1. **pdf_extractor**: pdfplumber 추출 → `제N조(제목)` 단위 분리 (줄 시작 + 괄호 제목만 인정 → 목차/상호참조 노이즈 차단)
 2. **rule_extractor**: 보장 키워드 **OR** 금액이 있으면 후보 (노이즈 제목 제외)
-3. **gpt_classifier.filter_by_gpt**: GPT 1차로 '보장 관련' 조항만 선별 (temp=0, max_tokens=50)
-4. **gpt_classifier.classify_candidates**: GPT 2차로 보장 정보 상세 추출 (표/목록은 항목별로 열거)
-5. **verifier**: 원문 대조 0~100 신뢰도 (source_quote는 정확일치 **또는 어절 70% 겹침** 인정)
+3. **gpt_classifier.classify_candidates**: GPT로 보장 정보 상세 추출 (표/목록은 항목별로 열거)
+4. **verifier**: 원문 대조 0~100 신뢰도 (source_quote는 정확일치 **또는 어절 70% 겹침** 인정)
+
+> `gpt_classifier.filter_by_gpt`(GPT 1차 판단)는 회수율 우선 결정으로 **파이프라인에서 제외됨**. 함수는 남아 있음. (10번 참고)
 
 ## 4. 파일 구조 & 역할
 
@@ -89,7 +90,6 @@ bc41da4 chore: data/parsed/ 폴더 .gitkeep 포함
 7b9b88b docs: README 4→5단계 갱신
 95aaedf 초기 커밋
 ```
-⚠️ **미커밋 변경 있음**: `parser/gpt_classifier.py` (filter_by_gpt를 lenient로 수정한 상태 — 아래 10번 참고)
 
 ## 9. 최종 테스트 결과 (무배당 삼성화재 실손 2501.5)
 
@@ -101,12 +101,12 @@ bc41da4 chore: data/parsed/ 폴더 .gitkeep 포함
 
 ## 10. ⚠️ 미해결 / 다음 작업자가 결정할 것
 
-**GPT 1차 필터(filter_by_gpt)의 recall 트레이드오프** — 가장 중요
-- 1차 필터가 후보 77개 → 17개로 줄여 보장이 38건에 그침.
-- 1차 필터를 **비활성화**(또는 더 느슨하게)하면 보장 ~60건까지 나옴 (accuracy_compare 측정치).
-- 1차 필터는 GPT 호출 비용 절감용이지만 본질적으로 recall을 깎음.
-- 현재 `gpt_classifier.py`는 lenient 버전으로 **미커밋** 상태. 
-- **결정 필요**: 비용 절감(1차 필터 유지) vs 최대 회수율(1차 필터 제거). 후자 원하면 `main.py run()`에서 `filter_by_gpt` 단계를 빼고 `classify_candidates(select_candidate_articles(...))`로 직접 연결.
+**GPT 1차 필터(filter_by_gpt)의 recall 트레이드오프** — ✅ **결정 완료 (2026-07-10)**
+- **결정: 회수율(recall) 우선으로 1차 필터를 파이프라인에서 제거함.** 보장 추출 38건 → ~60건.
+- 배경: 1차 필터가 후보 77개 → 17개로 줄여 진짜 보장 조항까지 걸러냈음. GPT 호출 비용 절감용이었으나 본질적으로 recall을 깎음.
+- 적용: `main.py run()`에서 `filter_by_gpt` 호출 제거, `classify_candidates(select_candidate_articles(...))`로 직접 연결. 파이프라인 5단계 → **4단계**.
+- `filter_by_gpt` 함수 자체는 `parser/gpt_classifier.py`에 **남겨둠** (비용 절감이 다시 필요하면 재활성화 가능).
+- 트레이드오프: GPT 호출 수가 늘어 비용 증가. 큰 약관 처리 시 비용 모니터링 필요.
 
 ## 11. ⚠️ 알려진 환경 이슈 (중요)
 

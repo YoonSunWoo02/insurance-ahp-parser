@@ -27,7 +27,7 @@ except ImportError:
 
 from parser.pdf_extractor import extract_articles
 from parser.rule_extractor import filter_candidates, select_candidate_articles
-from parser.gpt_classifier import classify_candidates, filter_by_gpt
+from parser.gpt_classifier import classify_candidates
 from validator.verifier import verify_all
 from toxic_detector import detect_toxic_clauses, summarize as summarize_toxic
 
@@ -85,7 +85,7 @@ def run(
         raise FileNotFoundError(f"PDF 파일을 찾을 수 없습니다: {pdf_path}")
 
     # 1) 추출 + 조항 분리
-    print(f"[1/5] PDF 텍스트 추출 및 조항 분리: {path.name}", file=sys.stderr)
+    print(f"[1/4] PDF 텍스트 추출 및 조항 분리: {path.name}", file=sys.stderr)
     articles = extract_articles(str(path))
     print(f"      → {len(articles)}개 조항", file=sys.stderr)
 
@@ -96,7 +96,7 @@ def run(
         return result
 
     # 2) 규칙 기반 1차 분류 (완화된 조건: 보장 키워드 OR 금액)
-    print("[2/5] 정규식 1차 분류 (보장 키워드 OR 금액 후보 선별)", file=sys.stderr)
+    print("[2/4] 정규식 1차 분류 (보장 키워드 OR 금액 후보 선별)", file=sys.stderr)
     candidates = filter_candidates(articles)
     print(f"      → 후보 {len(candidates)}개 조항", file=sys.stderr)
 
@@ -110,17 +110,19 @@ def run(
             _run_toxic(articles, result)
         return result
 
-    # 3) GPT 1차 판단 (규칙 후보 중 '보장 관련' 조항만 빠르게 선별)
-    print("[3/5] GPT 1차 판단 (보장 관련 조항 선별)", file=sys.stderr)
-    rule_candidates = select_candidate_articles(articles)
-    coverage_articles = filter_by_gpt(rule_candidates)
+    # 보장 관련 조항 선별도 규칙 기반으로 처리 (GPT 1차 필터는 회수율 우선으로 제거)
+    coverage_articles = select_candidate_articles(articles)
+    print(
+        f"      → 보장 관련 조항 {len(coverage_articles)}개 선별 (규칙 기반)",
+        file=sys.stderr,
+    )
 
-    # 4) GPT 2차 상세 추출 (선별된 조항만 — classify_candidates는 그대로 사용)
-    print("[4/5] GPT 보장 정보 상세 추출", file=sys.stderr)
+    # 3) GPT 상세 추출 (선별된 조항만 — classify_candidates는 그대로 사용)
+    print("[3/4] GPT 보장 정보 상세 추출", file=sys.stderr)
     gpt_results = classify_candidates(coverage_articles)
 
-    # 5) 원문 대조 검증 (각 결과에 동봉된 원본 조항과 1:1 대조)
-    print("[5/5] 원문 대조 검증 및 신뢰도 점수 부여", file=sys.stderr)
+    # 4) 원문 대조 검증 (각 결과에 동봉된 원본 조항과 1:1 대조)
+    print("[4/4] 원문 대조 검증 및 신뢰도 점수 부여", file=sys.stderr)
     verified = verify_all(gpt_results)
 
     total_cov = sum(len(v["coverages"]) for v in verified)

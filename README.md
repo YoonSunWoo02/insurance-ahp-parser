@@ -4,19 +4,22 @@
 추출하고, 원문과 대조해 신뢰도 점수를 부여하는 파이프라인. 독소조항(계약자에게
 불리한 조항) 탐지와 Supabase 적재까지 지원한다.
 
-## 파이프라인 (5단계)
+## 파이프라인 (4단계)
 
 ```
-PDF ─▶ pdf_extractor ─▶ rule_extractor ─▶ gpt_classifier ─▶ gpt_classifier ─▶ verifier ─▶ JSON
-      텍스트/제N조 분리   규칙 1차 후보     GPT 1차 판단      GPT 2차 상세      원문대조·신뢰도
-                        (보장키워드 OR 금액) (보장 관련 선별)   (보장정보 추출)
+PDF ─▶ pdf_extractor ─▶ rule_extractor ─▶ gpt_classifier ─▶ verifier ─▶ JSON
+      텍스트/제N조 분리   규칙 기반 선별     GPT 상세 추출     원문대조·신뢰도
+                        (보장키워드 OR 금액) (보장정보 추출)
 ```
 
 1. **pdf_extractor** — pdfplumber로 텍스트 추출, `제N조(제목)` 단위 조항 분리
 2. **rule_extractor** — 보장 키워드 OR 금액이 있는 조항을 후보로 선별(노이즈 제목 제외)
-3. **gpt_classifier.filter_by_gpt** — GPT 1차 판단으로 '보장 관련' 조항만 빠르게 선별
-4. **gpt_classifier.classify_candidates** — GPT 2차로 보장 정보를 구조화 JSON으로 상세 추출
-5. **verifier** — 추출 결과를 원문과 대조해 0~100 신뢰도 점수 부여
+3. **gpt_classifier.classify_candidates** — GPT로 보장 정보를 구조화 JSON으로 상세 추출
+4. **verifier** — 추출 결과를 원문과 대조해 0~100 신뢰도 점수 부여
+
+> **GPT 1차 판단(`filter_by_gpt`)은 현재 비활성화됨.** 회수율(recall)을 우선하기로 결정해
+> 파이프라인에서 제외했다(보장 추출 38건 → ~60건). 함수 자체는 `parser/gpt_classifier.py`에
+> 남아 있어 필요 시 다시 켤 수 있다.
 
 ## 설치
 
@@ -57,7 +60,7 @@ python accuracy_compare.py "data/raw_pdfs/약관.pdf"
 |------|------|
 | `parser/pdf_extractor.py` | pdfplumber 텍스트 추출, `제N조` 단위 조항 분리 |
 | `parser/rule_extractor.py` | 보장/질병 키워드 + 금액 패턴 감지, 노이즈 제목 필터 |
-| `parser/gpt_classifier.py` | GPT 1차 판단(filter_by_gpt) + 2차 상세 추출(보장명/금액/급여구분/본인부담금 등) |
+| `parser/gpt_classifier.py` | GPT 상세 추출(보장명/금액/급여구분/본인부담금 등). `filter_by_gpt`는 비활성화(미사용) |
 | `validator/verifier.py` | 원문 대조 검증 + 신뢰도 점수(0~100) |
 | `toxic_detector.py` | 독소조항(면책·제한·감액·기간제한·고지의무) 탐지 |
 | `upload_to_supabase.py` | 파싱 결과 → Supabase 적재 (`--list`로 목록 확인) |
