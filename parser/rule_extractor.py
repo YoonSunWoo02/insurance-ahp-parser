@@ -71,8 +71,10 @@ NOISE_TITLE_KEYWORDS = [
     # 약관 뒤에 첨부된 법령 인용 조문 (상품 보장이 아님)
     "요양급여", "급여비용의 부담", "급여비용의 청구",
     "의료급여의 제한", "의료급여의 변경", "의료급여의 중지",
+    "의료급여의 내용",  # 국민건강보험법상 요양급여 종류를 나열 → 보장 오탐 (참편한실손 1901 제7조)
     "수급권자의 인정 절차", "난민에 대한 특례",
     "유산 또는 사산", "복수출생",
+    "응급환자", "응급증상",  # 응급의료법상 판정 기준 나열 → 보장 오탐 (참편한실손 1901 제2조)
     "상급종합병원 지정", "신의료기술평가위원회", "의료기관의 시설기준",
     "보건진료소", "운동기능장해의 측정", "과로한 때 등의 운전 금지",
 ]
@@ -80,10 +82,36 @@ NOISE_TITLE_KEYWORDS = [
 # 유효 금액으로 인정하는 큰 단위 (이 단위가 없는 소액 원화는 이자 계산식 등으로 간주)
 LARGE_UNITS = ["천만", "백만", "억", "만"]
 
+# 법령 인용/정의 패턴 — 조항이 상품 보장이 아니라 법률 조문을 나열/정의하는지 판단용.
+#   「국민건강보험법」, 「응급의료에 관한 법률」 …  (낫표로 감싼 법령명)
+#   법 제41조 / 법률 제2조 / 시행령 제5조 …        (법령 + 제N조 인용)
+LAW_CITATION_PATTERN = re.compile(
+    r"「[^」]*(?:법|법률)[^」]*」"
+    r"|(?:법|법률|시행령|시행규칙)\s*제\s*\d+\s*조"
+)
+
 
 def is_noise_title(title: str) -> bool:
     """보장과 무관한 노이즈 제목(용어 정의/예금보험/준용규정 등)인지."""
     return any(kw in title for kw in NOISE_TITLE_KEYWORDS)
+
+
+def is_law_citation(text: str, amounts: list[str] | None = None) -> bool:
+    """법령을 인용·정의하는 조항인지 판단한다.
+
+    「○○법」 인용이나 "법 제N조" 형태가 있으면서 **금액 표현이 전혀 없는** 조항은
+    상품 보장이 아니라 법률 조문(예: 국민건강보험법상 요양급여 종류, 응급의료법상
+    응급증상 판정 기준)을 나열/정의하는 조항으로 본다.
+
+    실제 보장 조항도 근거 법령을 언급할 수 있으므로, 금액이 하나라도 있으면
+    보장으로 간주해 제외하지 않는다(회수율 훼손 최소화). amounts를 넘기면
+    재계산을 생략한다.
+    """
+    if not LAW_CITATION_PATTERN.search(text):
+        return False
+    if amounts is None:
+        amounts = detect_amounts(text)
+    return not amounts
 
 
 def is_noise_amount(amount: str) -> bool:
@@ -159,9 +187,11 @@ def classify_article(article: Article) -> dict:
         # 보장 키워드 OR 금액 중 하나만 있어도 후보 (노이즈 제목은 제외).
         # 회수율(recall)을 높이고, 정밀도는 노이즈 제목 필터와
         # 후처리 단계의 신뢰도 임계값(postprocess.MIN_CONFIDENCE)이 보강한다.
+        # 단, 금액 없이 법령만 인용/정의하는 조항은 상품 보장이 아니므로 제외한다.
         "is_candidate": (
             (bool(coverages) or bool(amounts))
             and not is_noise_title(article.title)
+            and not is_law_citation(text, amounts)
         ),
     }
 

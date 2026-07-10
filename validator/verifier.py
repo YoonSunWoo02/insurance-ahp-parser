@@ -29,6 +29,36 @@ def _contains(haystack_norm: str, needle: str) -> bool:
 # source_quote 어절 겹침 인정 임계값 (이 비율 이상 어절이 원문에 있으면 인정)
 QUOTE_OVERLAP_THRESHOLD = 0.7
 
+# GPT enum 필드별 허용값. 이 목록에 정확히 속하지 않는 값(예: GPT가 선택지 문자열
+# "주계약 | 특약 | 불명"을 통째로 반환한 경우)은 "불명"으로 강제 치환하고 감점한다.
+ALLOWED_ENUM_VALUES: dict[str, set[str]] = {
+    "contract_type": {"주계약", "특약", "불명"},
+    "coverage_type": {"입원", "통원", "수술", "불명"},
+    "benefit_type": {"급여", "비급여", "급여+비급여", "불명"},
+}
+
+# enum 필드 1개가 유효하지 않을 때마다 신뢰도에서 깎는 점수
+ENUM_INVALID_PENALTY = 10
+
+
+def _validate_enum_fields(coverage: dict) -> tuple[dict, dict, int]:
+    """GPT enum 필드(contract_type/coverage_type/benefit_type)의 유효성을 검사한다.
+
+    허용값에 정확히 속하지 않으면 해당 필드를 "불명"으로 치환한다.
+    반환: (치환된 필드 dict, {필드명+"_valid": bool} 검증결과, 총 감점).
+    """
+    corrected: dict[str, str] = {}
+    checks: dict[str, bool] = {}
+    penalty = 0
+    for field, allowed in ALLOWED_ENUM_VALUES.items():
+        val = coverage.get(field)
+        valid = isinstance(val, str) and val.strip() in allowed
+        checks[f"{field}_valid"] = valid
+        if not valid:
+            corrected[field] = "불명"
+            penalty += ENUM_INVALID_PENALTY
+    return corrected, checks, penalty
+
 
 def _quote_in_source(haystack_norm: str, quote: str) -> bool:
     """source_quote가 원문에 있는지 느슨하게 판정한다.
@@ -89,13 +119,21 @@ def verify_coverage(coverage: dict, source_text: str) -> dict:
     if quote_hit:
         score += 25
 
-    score = min(score, 100)
-    return {
+    # 5) GPT enum 필드 유효성 검사 — 허용값 외 값은 "불명"으로 치환하고 필드당 감점
+    corrected, enum_checks, penalty = _validate_enum_fields(coverage)
+    checks.update(enum_checks)
+    score -= penalty
+
+    score = max(0, min(score, 100))
+    result = {
         "coverage_name": name,
         "confidence": score,
         "level": _level(score),
         "checks": checks,
     }
+    # 유효하지 않았던 필드만 "불명"으로 덮어쓴다 (유효 필드는 원본값 유지)
+    result.update(corrected)
+    return result
 
 
 def _name_tokens(name: str) -> list[str]:
