@@ -29,6 +29,7 @@ from parser.pdf_extractor import extract_articles
 from parser.rule_extractor import filter_candidates, select_candidate_articles
 from parser.gpt_classifier import classify_candidates
 from validator.verifier import verify_all
+from postprocess import postprocess
 from toxic_detector import detect_toxic_clauses, summarize as summarize_toxic
 
 
@@ -124,6 +125,9 @@ def run(
     # 4) 원문 대조 검증 (각 결과에 동봉된 원본 조항과 1:1 대조)
     print("[4/4] 원문 대조 검증 및 신뢰도 점수 부여", file=sys.stderr)
     verified = verify_all(gpt_results)
+
+    # 저신뢰 금액 무효화 + null 금액 채움 + 동일 보장 중복 제거 (JSON에도 반영)
+    postprocess(verified)
 
     total_cov = sum(len(v["coverages"]) for v in verified)
     result = {

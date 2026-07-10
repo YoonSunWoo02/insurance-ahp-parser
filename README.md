@@ -7,8 +7,8 @@
 ## 파이프라인 (4단계)
 
 ```
-PDF ─▶ pdf_extractor ─▶ rule_extractor ─▶ gpt_classifier ─▶ verifier ─▶ JSON
-      텍스트/제N조 분리   규칙 기반 선별     GPT 상세 추출     원문대조·신뢰도
+PDF ─▶ pdf_extractor ─▶ rule_extractor ─▶ gpt_classifier ─▶ verifier ─▶ postprocess ─▶ JSON
+      텍스트/제N조 분리   규칙 기반 선별     GPT 상세 추출     원문대조·신뢰도   정제
                         (보장키워드 OR 금액) (보장정보 추출)
 ```
 
@@ -20,6 +20,19 @@ PDF ─▶ pdf_extractor ─▶ rule_extractor ─▶ gpt_classifier ─▶ veri
 > **GPT 1차 판단(`filter_by_gpt`)은 현재 비활성화됨.** 회수율(recall)을 우선하기로 결정해
 > 파이프라인에서 제외했다(보장 추출 38건 → ~60건). 함수 자체는 `parser/gpt_classifier.py`에
 > 남아 있어 필요 시 다시 켤 수 있다.
+
+### 후처리 (`postprocess.py`)
+
+verifier 결과를 JSON으로 쓰기 직전(그리고 DB 적재 직전)에 아래 3단계를 **순서대로** 적용한다.
+`main.py`와 `upload_to_supabase.py`가 같은 모듈을 공유하며, 여러 번 실행해도 결과가 같다(멱등).
+
+1. **저신뢰 금액 무효화** — `confidence < 50`이면 `amount`를 `null`로 지운다(항목은 유지).
+   원문 대조에 실패한 금액은 환각일 수 있어 신뢰하지 않는다.
+2. **amount 채우기** — 같은 `coverage_name` 그룹에 신뢰 가능한 금액이 있으면 `null` 항목에 채운다.
+   1번을 먼저 돌려야 환각 금액이 donor가 되어 그룹 전체로 번지는 것을 막을 수 있다.
+3. **중복 제거(dedup)** — `(coverage_name, amount, contract_type)`이 같으면 같은 보장으로 보고
+   `confidence`가 가장 높은 1건만 남긴다. `payment_condition`은 GPT가 조항마다 다르게 인용하므로
+   키에 넣지 않는다.
 
 ## 설치
 
@@ -62,6 +75,7 @@ python accuracy_compare.py "data/raw_pdfs/약관.pdf"
 | `parser/rule_extractor.py` | 보장/질병 키워드 + 금액 패턴 감지, 노이즈 제목 필터 |
 | `parser/gpt_classifier.py` | GPT 상세 추출(보장명/금액/급여구분/본인부담금 등). `filter_by_gpt`는 비활성화(미사용) |
 | `validator/verifier.py` | 원문 대조 검증 + 신뢰도 점수(0~100) |
+| `postprocess.py` | 저신뢰 금액 무효화 + amount 채우기 + 중복 보장 dedup (main/upload 공용) |
 | `toxic_detector.py` | 독소조항(면책·제한·감액·기간제한·고지의무) 탐지 |
 | `upload_to_supabase.py` | 파싱 결과 → Supabase 적재 (`--list`로 목록 확인) |
 | `accuracy_compare.py` | GPT 단독 vs 파이프라인 정확도(완결성·원문일치·노이즈) 비교 |

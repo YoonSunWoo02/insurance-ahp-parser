@@ -39,6 +39,8 @@ PDF → pdf_extractor → rule_extractor → gpt_classifier → verifier → JSO
 3. **gpt_classifier.classify_candidates**: GPT로 보장 정보 상세 추출 (표/목록은 항목별로 열거)
 4. **verifier**: 원문 대조 0~100 신뢰도 (source_quote는 정확일치 **또는 어절 70% 겹침** 인정)
 
+이후 **postprocess.py**가 JSON 저장 전(그리고 DB 적재 전)에 정제 3단계를 적용한다 → 저신뢰 금액 무효화 → amount 채우기 → 중복 dedup. (12번 참고)
+
 > `gpt_classifier.filter_by_gpt`(GPT 1차 판단)는 회수율 우선 결정으로 **파이프라인에서 제외됨**. 함수는 남아 있음. (10번 참고)
 
 ## 4. 파일 구조 & 역할
@@ -48,8 +50,9 @@ PDF → pdf_extractor → rule_extractor → gpt_classifier → verifier → JSO
 | `main.py` | 진입점. `--toxic`/`--toxic-only`/`--no-gpt`/`--out`/`--stdout` |
 | `parser/pdf_extractor.py` | 텍스트 추출 + 조항 분리 |
 | `parser/rule_extractor.py` | 키워드/금액 감지, 노이즈 제목·금액 필터, 후보 선별 |
-| `parser/gpt_classifier.py` | GPT 1차 판단(filter_by_gpt) + 2차 상세 추출 |
+| `parser/gpt_classifier.py` | GPT 상세 추출. `filter_by_gpt`는 정의만 남고 미사용 |
 | `validator/verifier.py` | 원문 대조 검증 + 신뢰도 |
+| `postprocess.py` | 저신뢰 금액 무효화 + amount 채우기 + dedup (main/upload 공용, 멱등) |
 | `toxic_detector.py` | 독소조항 탐지 (키워드 후보 → GPT 판단 → source_quote 검증 필터) |
 | `upload_to_supabase.py` | Supabase 적재, `--list`, `data/parsed/` 자동 탐색 |
 | `accuracy_compare.py` | GPT 단독 vs 파이프라인 정확도 비교 |
@@ -91,22 +94,52 @@ bc41da4 chore: data/parsed/ 폴더 .gitkeep 포함
 95aaedf 초기 커밋
 ```
 
-## 9. 최종 테스트 결과 (무배당 삼성화재 실손 2501.5)
+## 9. 최종 테스트 결과 (무배당 삼성화재 실손 2501.5) — 2026-07-10 갱신
 
-| | 값 |
-|---|---|
-| 추출 보장 | **38건** (신뢰도 평균 78) |
-| 독소조항 | **47건 / 31조항** |
-| 저장 | `data/parsed/무배당 삼성화재 실손의료비보험(2501.5)_*.json` |
+| 단계 | GPT 투입 조항 | 보장 건수 |
+|---|---|---|
+| (구) 1차 필터 있음 | 16 | 41 |
+| 1차 필터 제거만 | 77 | 65 (**62%가 노이즈**) |
+| + 노이즈 제목 필터 | 55 | 26 |
+| **+ 후처리(dedup 포함) → 현재** | 55 | **19** |
+
+- 독소조항: **47건 / 31조항** (변동 없음)
+- 저장: `data/parsed/무배당 삼성화재 실손의료비보험(2501.5)_*.json`
+- 건수는 줄었지만 내용은 실제 보장만 남음: `상해급여`·`질병급여`·`상해비급여`·`질병비급여`(각 5천만원), `본인부담금 상한제`, `상급병실료` 등.
 
 ## 10. ⚠️ 미해결 / 다음 작업자가 결정할 것
 
-**GPT 1차 필터(filter_by_gpt)의 recall 트레이드오프** — ✅ **결정 완료 (2026-07-10)**
-- **결정: 회수율(recall) 우선으로 1차 필터를 파이프라인에서 제거함.** 보장 추출 38건 → ~60건.
-- 배경: 1차 필터가 후보 77개 → 17개로 줄여 진짜 보장 조항까지 걸러냈음. GPT 호출 비용 절감용이었으나 본질적으로 recall을 깎음.
-- 적용: `main.py run()`에서 `filter_by_gpt` 호출 제거, `classify_candidates(select_candidate_articles(...))`로 직접 연결. 파이프라인 5단계 → **4단계**.
-- `filter_by_gpt` 함수 자체는 `parser/gpt_classifier.py`에 **남겨둠** (비용 절감이 다시 필요하면 재활성화 가능).
-- 트레이드오프: GPT 호출 수가 늘어 비용 증가. 큰 약관 처리 시 비용 모니터링 필요.
+### ✅ 해결됨 (2026-07-10)
+
+**1) GPT 1차 필터(filter_by_gpt) recall 트레이드오프 — 결정 완료**
+- **회수율 우선으로 1차 필터를 파이프라인에서 제거함.** 파이프라인 5단계 → **4단계**.
+- `main.py run()`에서 `filter_by_gpt` 호출 제거, `classify_candidates(select_candidate_articles(...))`로 직접 연결.
+- 함수 자체는 `parser/gpt_classifier.py`에 **남겨둠** (비용 절감이 다시 필요하면 재활성화 가능).
+- 대가: GPT 호출 16 → 55회(약 3.4배). 큰 약관은 비용 모니터링 필요.
+
+**2) 필터 제거 후 노이즈 폭증 → 노이즈 제목 필터로 대응**
+- 1차 필터가 사라지자 면책조항(`보상하지 않는 사항`)과 약관 뒤 법령 인용 조문이 GPT에 그대로 들어가 65건 중 **40건(62%)이 노이즈**가 됨. GPT가 "보장하지 **않는** 항목"을 보장으로 뒤집어 읽음.
+- `rule_extractor.NOISE_TITLE_KEYWORDS`에 면책조항·법령 인용 조문 제목 추가 → 후보 77 → 55개.
+
+**3) 저신뢰 금액 환각 → postprocess에서 무효화**
+- `상해입원의료비 "1,000만원"` 등 confidence 0인데 금액이 적재되던 문제. `confidence < 50`이면 **amount만 null**로 지우고 항목은 유지(`postprocess.clear_low_confidence_amounts`).
+- **순서 주의**: 무효화 → amount 채우기 순이어야 환각 금액이 donor로 그룹 전체에 번지지 않는다.
+
+**4) 중복 보장 → postprocess에서 dedup**
+- 같은 보장이 여러 조항에 서술되어 `product_coverage`에 중복 적재되던 문제. `(coverage_name, amount, contract_type)` 기준으로 **confidence 최고 1건만** 남김. 26 → 19건.
+- `payment_condition`은 키에서 **뺐다**. GPT가 조항마다 원문을 다르게 인용해 넣으면 중복이 하나도 안 잡힌다(실측 26 → 26건).
+
+### 남은 이슈
+
+**a) GPT의 `contract_type` 라벨 불일치**
+- `상해비급여`/`질병비급여`가 한 조항에선 `특약`(conf 85), 다른 조항에선 `주계약`(conf 100)으로 라벨링됨. 4세대 실손 기준 비급여는 **특약**이 맞으므로 conf 100쪽 라벨이 오히려 틀림.
+- dedup 키에 `contract_type`이 있어 둘 다 살아남음(19건 중 4건). 임의 병합하지 않고 보존 중. → GPT 프롬프트에 주계약/특약 판단 기준을 명시하는 게 근본 해결.
+
+**b) `parse_amount`가 범위 금액의 하한만 취함**
+- `"81만원~584만원"` → `810,000`, `"5만원 | 80만원 | 120만원"` → `50,000`. 본인부담금 상한제는 소득분위별 구간이라 단일 값이 아님. JSON엔 원본 문자열이 남아 있어 손실은 없으나 `coverage_amount` 컬럼만 보면 오해 소지.
+
+**c) Supabase 프로젝트 접속 불가 (2026-07-10 확인)**
+- `kdkrtgpbxxevhvnnkarg.supabase.co` → **NXDOMAIN**(공용 DNS에서도 동일). 프로젝트 일시정지 또는 삭제로 추정. **DB에는 아직 구버전 41건이 남아 있음** — 복구 후 재적재 필요.
 
 ## 11. ⚠️ 알려진 환경 이슈 (중요)
 
@@ -121,5 +154,8 @@ bc41da4 chore: data/parsed/ 폴더 .gitkeep 포함
 - **rule_extractor 완화**: 보장+금액 AND → OR. 회수율↑, 정밀도는 뒤 단계가 보강.
 - **parse_amount 버그**: "5천만원"이 `5`로 적재되던 것 → `천만원` 패턴 우선 처리로 50,000,000 교정.
 - **verifier 완화**: GPT가 인용을 살짝 바꿔도 인정하도록 source_quote를 "정확일치 OR 어절 70%"로. (노이즈 비율 8.3%→1.6%)
+- **postprocess 공용 모듈화**: 정제 로직이 `upload_to_supabase.py`에만 있어 JSON 산출물은 정제되지 않는 문제가 있었음. `postprocess.py`로 빼서 `main.py`(JSON 저장 전)와 `upload_to_supabase.py`(DB 적재 전)가 공유. 멱등이라 두 번 돌아도 안전.
+- **저신뢰 항목: 제거 대신 금액만 null**: 보장명 자체는 실재할 수 있으므로 항목을 버리지 않음. AHP 등 후속 분석에서 보장 목록이 필요하기 때문.
+- **dedup 키에서 payment_condition 제외**: GPT가 조항마다 원문을 다르게 인용해 키로 쓰면 중복이 전혀 안 잡힘(실측 26→26건).
 - **노이즈 제목 확장**: 배당금·약관해석·연대책임·해약환급금·보험료납입 등 절차성 조항 제외.
 - **독소조항 필터**: source_quote 15자 미만 제외 + 원문 대조 실패(환각) 제외, summary에 제외 건수 기록.
