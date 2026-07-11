@@ -67,6 +67,12 @@ MIN_BODY_LENGTH = 50
 # source_quote가 이 길이 미만이면 근거가 빈약한 것으로 보고 신뢰 불가 처리한다.
 MIN_QUOTE_LENGTH = 15
 
+# 조 번호가 이 값을 넘으면 상품 조항이 아니라 '인용된 법령 조문'이 헤더로 잘못 분리된
+# 파싱 아티팩트로 본다. 소비자 보험약관 본문 조 번호는 (특약별로 재시작하므로) 사실상
+# 제99조를 넘지 않는다. 3자리 조 번호(예: 상법 제657조, 제663조)는 약관이 본문에 인용한
+# 법령 조문이 "제657조(보험사고발생의 통지의무)"처럼 조항 헤더로 오인식된 경우다.
+MAX_PLAUSIBLE_ARTICLE_NO = 99
+
 
 def _is_noise_title(title: str) -> bool:
     """독소조항과 무관한 노이즈 제목인지."""
@@ -84,7 +90,10 @@ def matched_keywords(text: str) -> list[str]:
 
 
 def is_candidate(article: Article) -> bool:
-    """조항이 독소조항 후보인지 (키워드 포함 & 노이즈 제목·목차 stub 아님)."""
+    """조항이 독소조항 후보인지 (키워드 포함 & 노이즈 제목·목차 stub·비정상 조번호 아님)."""
+    if article.number > MAX_PLAUSIBLE_ARTICLE_NO:
+        # 인용된 법령 조문(상법 제657조 등)이 조항 헤더로 잘못 분리된 파싱 아티팩트 → 제외
+        return False
     if _is_noise_title(article.title):
         return False
     if len(article.body) < MIN_BODY_LENGTH:
@@ -179,6 +188,32 @@ def _filter_clauses(clauses: list[dict], source_text: str) -> tuple[list[dict], 
     return kept, excluded_short, excluded_not_in_source
 
 
+def _dedup_clauses(results: list[dict]) -> tuple[list[dict], int]:
+    """여러 조항에 걸쳐 동일 원문(source_quote)을 인용한 중복 독소조항을 제거한다.
+
+    같은 근거 문장이 여러 조항에서 반복 추출되면 DB에 같은 독소조항이 여러 행으로
+    쌓인다. 정규화한 source_quote가 같으면 같은 독소조항으로 보고 **처음 것만** 남긴다.
+    조항 순서·구조는 유지하고, 비게 된 조항은 결과에서 뺀다.
+
+    반환: (중복 제거된 results, 제거 건수).
+    """
+    seen: set[str] = set()
+    deduped: list[dict] = []
+    removed = 0
+    for art in results:
+        kept = []
+        for c in art.get("toxic_clauses", []):
+            key = _norm_text(c.get("source_quote") or "")
+            if key and key in seen:
+                removed += 1
+                continue
+            seen.add(key)
+            kept.append(c)
+        if kept:
+            deduped.append({**art, "toxic_clauses": kept})
+    return deduped, removed
+
+
 def detect_toxic_clauses(articles: list[Article]) -> tuple[list[dict], dict]:
     """전체 조항 중 후보만 GPT로 판단해 독소조항이 있는 조항만 반환한다.
 
@@ -225,14 +260,18 @@ def detect_toxic_clauses(articles: list[Article]) -> tuple[list[dict], dict]:
                 }
             )
 
+    # 여러 조항에 걸친 동일 원문 중복 독소조항 제거 (구조적 정리)
+    results, deduped_total = _dedup_clauses(results)
+
     filter_stats = {
         "excluded_short_quote": excluded_short_total,
         "excluded_not_in_source": excluded_not_in_source_total,
+        "deduped": deduped_total,
     }
     print(
         f"      → 독소조항 발견 조항 {len(results)}개 "
         f"(필터 제외: 짧은인용 {excluded_short_total}건, "
-        f"원문불일치 {excluded_not_in_source_total}건)",
+        f"원문불일치 {excluded_not_in_source_total}건, 중복 {deduped_total}건)",
         file=sys.stderr,
     )
     return results, filter_stats
@@ -250,8 +289,11 @@ def summarize(toxic_results: list[dict], filter_stats: dict | None = None) -> di
         summary["excluded_not_in_source"] = filter_stats.get(
             "excluded_not_in_source", 0
         )
+        summary["deduped"] = filter_stats.get("deduped", 0)
         summary["total_excluded"] = (
-            summary["excluded_short_quote"] + summary["excluded_not_in_source"]
+            summary["excluded_short_quote"]
+            + summary["excluded_not_in_source"]
+            + summary["deduped"]
         )
     return summary
 

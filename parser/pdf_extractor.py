@@ -21,6 +21,29 @@ ARTICLE_PATTERN = re.compile(
     re.MULTILINE,
 )
 
+# 부록(별표/부록/붙임/별지) 섹션 시작 표시.
+# 줄머리에 여는 낫표/대괄호 + '별표'류가 오면 그 지점부터는 조항 본문이 아니라
+# 뒤에 붙은 부록 표(용어정의표·질병분류표·적립이율표 등)로 본다.
+#   예) "【별표1】 용어의 정의", "[별표3] 설명사항", "[붙임2] ..."
+# 본문 속 인라인 참조("(【별표3】 참조)", "제1항([별표2] 비급여대상)")는 줄머리가
+# 아니라 괄호/문장 중간이므로 매칭되지 않는다 → 정당한 면책 목록 등은 보존된다.
+APPENDIX_PATTERN = re.compile(
+    r"^[ \t]*[\[【]\s*(?:별\s*표|부록|붙\s*임|별지)",
+    re.MULTILINE,
+)
+
+
+def _strip_appendix(body: str) -> str:
+    """조항 본문 뒤에 흡수된 별표/부록 표를 잘라낸다.
+
+    약관 본문의 마지막 조항(예: '예금보험에 의한 지급보장')은 바로 뒤에 오는 별표
+    (제N조 헤더가 없는 부록 표)를 통째로 본문에 흡수해, 제목과 무관한 내용(질병분류표
+    등)이 섞인다. 줄머리 [별표N]/【별표N】/부록/붙임/별지를 부록 시작으로 보고 그 앞까지만
+    남긴다. 부록 마커가 없으면 원본을 그대로 반환한다.
+    """
+    m = APPENDIX_PATTERN.search(body)
+    return body[: m.start()].rstrip() if m else body
+
 
 @dataclass
 class Article:
@@ -73,8 +96,8 @@ def split_articles(text: str) -> list[Article]:
         number = int(m.group(1))
         title = (m.group(2) or "").strip()
         raw_header = m.group(0).strip()
-        # 본문 = 헤더 끝 ~ 다음 헤더 시작
-        body = text[m.end():end].strip()
+        # 본문 = 헤더 끝 ~ 다음 헤더 시작 (뒤에 흡수된 별표/부록 표는 제거)
+        body = _strip_appendix(text[m.end():end].strip())
 
         articles.append(
             Article(
