@@ -90,6 +90,16 @@ LAW_CITATION_PATTERN = re.compile(
     r"|(?:법|법률|시행령|시행규칙)\s*제\s*\d+\s*조"
 )
 
+# 조 번호가 이 값을 넘으면 상품 조항이 아니라, 페이지 줄바꿈 때문에 "상법\n제651조(...)"
+# 처럼 법령 인용문의 "제N조(제목)"가 줄머리로 떨어져 조항 헤더로 잘못 분리된 경우로 본다.
+# 소비자 보험약관 본문 조 번호는 (특약별로 재시작하므로) 사실상 제99조를 넘지 않는다.
+# toxic_detector.py의 동일 기준(MAX_PLAUSIBLE_ARTICLE_NO)과 맞춘 값이다. 실측 결과
+# 이런 아티팩트가 KB/삼성화재/참편한 약관 전부에서 몇 건씩 나오는 것을 확인했다
+# (예: "상법 제651조(고지의무위반으로 인한 계약해지)"). 지금은 우연히 다른 필터에
+# 걸러지지만, 법령 인용문 안에 금액·비율 표현이 같이 있으면 걸러지지 않고 GPT 후보로
+# 넘어가 번호가 뒤죽박죽인 가짜 조항을 만들 수 있어 방어적으로 원천 차단한다.
+MAX_PLAUSIBLE_ARTICLE_NO = 99
+
 
 def is_noise_title(title: str) -> bool:
     """보장과 무관한 노이즈 제목(용어 정의/예금보험/준용규정 등)인지."""
@@ -187,11 +197,13 @@ def classify_article(article: Article) -> dict:
         # 보장 키워드 OR 금액 중 하나만 있어도 후보 (노이즈 제목은 제외).
         # 회수율(recall)을 높이고, 정밀도는 노이즈 제목 필터와
         # 후처리 단계의 신뢰도 임계값(postprocess.MIN_CONFIDENCE)이 보강한다.
-        # 단, 금액 없이 법령만 인용/정의하는 조항은 상품 보장이 아니므로 제외한다.
+        # 단, 금액 없이 법령만 인용/정의하는 조항은 상품 보장이 아니므로 제외하고,
+        # 조 번호가 비정상적으로 큰(법령 인용문이 헤더로 오분리된) 조항도 제외한다.
         "is_candidate": (
             (bool(coverages) or bool(amounts))
             and not is_noise_title(article.title)
             and not is_law_citation(text, amounts)
+            and article.number <= MAX_PLAUSIBLE_ARTICLE_NO
         ),
     }
 

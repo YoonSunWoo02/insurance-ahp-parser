@@ -111,6 +111,17 @@ USER_TEMPLATE = """다음 보험 약관 조항에서 계약자(가입자)에게 
 불리한 내용이 없으면 빈 배열로 답한다.
 원문에 없는 내용은 절대 지어내지 말고, source_quote는 원문을 그대로 인용한다.
 
+매우 중요 — 예외(단서) 조건도 함께 찾아라:
+"보상하지 않는 사항"류 조항은 "...한 경우. 다만, ~~인 경우에는 보상합니다"처럼
+원칙적으로 불리한 내용(면책) 뒤에 "다만," "단," 등으로 이어지는 예외 문구가 붙어
+그 불리함을 일부 되돌리는 경우가 많다. 이런 예외 문구가 있으면 절대 무시하거나
+source_quote에만 섞어 넣지 말고, exception과 exception_quote 필드에 별도로 채워라.
+  - exception: 예외 조건이 계약자에게 어떻게 유리하게 작용하는지 한 줄 요약
+    (예: "심신상실 등으로 자유로운 의사결정이 불가능했음이 증명되면 보상함")
+  - exception_quote: 그 예외 문구의 원문 그대로 인용 (반드시 조항 원문에 실제로 있는 문장)
+예외 문구가 전혀 없으면 exception과 exception_quote는 둘 다 null로 둔다.
+지어내지 마라 — 원문에 "다만/단/except" 류의 예외 문구가 없는데 있는 것처럼 만들면 안 된다.
+
 [조항 제목]
 {title}
 
@@ -124,7 +135,9 @@ USER_TEMPLATE = """다음 보험 약관 조항에서 계약자(가입자)에게 
       "clause_summary": "독소조항 핵심 요약",
       "reason": "계약자에게 불리한 이유",
       "severity": "높음 | 중간 | 낮음",
-      "source_quote": "근거가 된 원문 문장 (원문 그대로)"
+      "source_quote": "근거가 된 원문 문장 (원문 그대로)",
+      "exception": "예외(단서) 조건 요약. 없으면 null",
+      "exception_quote": "예외 조건 원문 그대로 인용. 없으면 null"
     }}
   ]
 }}
@@ -163,12 +176,39 @@ def detect_in_article(article: Article, client=None) -> list[dict]:
         return []
 
 
+def _clear_hallucinated_exception(clause: dict, src_norm: str) -> bool:
+    """exception_quote가 원문에 없으면(환각) exception 필드를 null로 지운다.
+
+    exception은 독소조항 본체와 달리 있으면 좋은 부가 정보이므로, 근거가
+    빈약하다고 해서 독소조항 전체(clause)를 버리지 않고 exception 필드만
+    무효화한다. exception이 애초에 없으면(둘 다 null) 손대지 않는다.
+
+    반환: exception을 지웠으면 True.
+    """
+    quote = (clause.get("exception_quote") or "").strip()
+    if not quote:
+        # exception만 채우고 exception_quote를 비워둔 경우도 근거 불명이므로 함께 정리
+        if clause.get("exception"):
+            clause["exception"] = None
+            clause["exception_quote"] = None
+            return True
+        return False
+    if len(quote) < MIN_QUOTE_LENGTH or not _in_source(src_norm, quote):
+        clause["exception"] = None
+        clause["exception_quote"] = None
+        return True
+    return False
+
+
 def _filter_clauses(clauses: list[dict], source_text: str) -> tuple[list[dict], int, int]:
     """GPT가 낸 독소조항을 후처리로 검증한다.
 
-    제외 기준:
+    독소조항 본체 제외 기준:
         1) source_quote가 MIN_QUOTE_LENGTH(15자) 미만 → 근거 빈약, 신뢰 불가
         2) source_quote가 원문에 실제로 없음 → 환각/오탐 (verifier 대조 로직 재사용)
+
+    exception/exception_quote는 같은 기준으로 검증하되, 실패해도 독소조항
+    본체는 살리고 exception 필드만 null로 지운다(_clear_hallucinated_exception).
 
     반환: (남은_clauses, 짧은인용_제외수, 원문불일치_제외수)
     """
@@ -184,6 +224,9 @@ def _filter_clauses(clauses: list[dict], source_text: str) -> tuple[list[dict], 
         if not _in_source(src_norm, quote):
             excluded_not_in_source += 1
             continue
+        c.setdefault("exception", None)
+        c.setdefault("exception_quote", None)
+        _clear_hallucinated_exception(c, src_norm)
         kept.append(c)
     return kept, excluded_short, excluded_not_in_source
 
@@ -280,9 +323,16 @@ def detect_toxic_clauses(articles: list[Article]) -> tuple[list[dict], dict]:
 def summarize(toxic_results: list[dict], filter_stats: dict | None = None) -> dict:
     """탐지 결과 요약을 만든다 (총 독소조항 수, 영향 조항 수, 필터 제외 수)."""
     total = sum(len(r["toxic_clauses"]) for r in toxic_results)
+    with_exception = sum(
+        1
+        for r in toxic_results
+        for c in r["toxic_clauses"]
+        if c.get("exception")
+    )
     summary = {
         "total_toxic_clauses": total,
         "affected_articles": len(toxic_results),
+        "with_exception": with_exception,
     }
     if filter_stats:
         summary["excluded_short_quote"] = filter_stats.get("excluded_short_quote", 0)

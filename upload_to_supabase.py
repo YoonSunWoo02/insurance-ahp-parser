@@ -24,7 +24,6 @@ Supabase DB에 저장한다.
 import argparse
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -52,6 +51,11 @@ except ImportError:
 # 다시 넣어도 멱등이므로 안전하다.
 from postprocess import MIN_CONFIDENCE, postprocess
 
+# 금액 문자열 → 원 단위 정수 변환은 validator/verifier.py와 로직을 공유한다.
+# (검증 단계의 "5,000만원"='5천만원' 동치 비교와 DB 적재용 변환이 서로 어긋나지
+# 않도록 파싱 규칙을 한 곳(parse_won_amount)에만 둔다.)
+from validator.verifier import parse_won_amount as parse_amount
+
 
 # ── Supabase 클라이언트 ────────────────────────────────────────
 def _get_client():
@@ -61,39 +65,6 @@ def _get_client():
         print("오류: .env에 SUPABASE_URL과 SUPABASE_KEY를 입력하세요.")
         sys.exit(1)
     return create_client(url, key)
-
-
-# ── 금액 문자열 → int 변환 ────────────────────────────────────
-def parse_amount(amount_str) -> int | None:
-    """금액 문자열을 정수(원)로 변환한다. 변환 불가 시 None.
-
-    처리 순서(먼저 매칭되는 패턴 적용):
-        1) "5천만원"              → 50,000,000   (× 10,000,000)
-        2) "500만원" / "5,000만원" → 5,000,000 / 50,000,000  (× 10,000)
-        3) "5000원"               → 5,000
-        4) 위 패턴 없으면          → None  (예: "5", null)
-    """
-    if not amount_str or str(amount_str).lower() == "null":
-        return None
-    s = str(amount_str).replace(",", "").replace(" ", "")
-
-    # 1) N천만원  (천만 = 10,000,000)
-    match = re.search(r"(\d+(?:\.\d+)?)천만원", s)
-    if match:
-        return int(float(match.group(1)) * 10_000_000)
-
-    # 2) N만원  (만 = 10,000) — "5,000만원"은 콤마 제거 후 "5000만원"
-    match = re.search(r"(\d+(?:\.\d+)?)만원", s)
-    if match:
-        return int(float(match.group(1)) * 10_000)
-
-    # 3) N원
-    match = re.search(r"(\d+)원", s)
-    if match:
-        return int(match.group(1))
-
-    # 4) 매칭 없음 → None (단순 숫자 "5" 등은 금액으로 인정하지 않음)
-    return None
 
 
 def _test_parse_amount() -> bool:

@@ -26,6 +26,56 @@ def _contains(haystack_norm: str, needle: str) -> bool:
     return bool(n) and n in haystack_norm
 
 
+# 원 단위 금액 표현을 찾는 범용 패턴 ("5,000만원", "5천만원", "1억원", "50,000,000원" 등).
+_WON_AMOUNT_PATTERN = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(?:억|천만|만)?\s*원")
+
+
+def parse_won_amount(amount_str) -> int | None:
+    """금액 문자열을 원 단위 정수로 정규화한다.
+
+    "5,000만원"과 "5천만원"은 표기만 다를 뿐 값은 둘 다 50,000,000원으로 같다.
+    이 함수로 그 둘을 같은 정수로 정규화해 비교할 수 있게 한다.
+    비율(%)이나 단순 숫자처럼 원 단위로 환산할 수 없는 값은 None을 반환한다.
+    (upload_to_supabase.py의 DB 적재용 parse_amount와 같은 로직을 공유한다.)
+    """
+    if not amount_str or str(amount_str).strip().lower() == "null":
+        return None
+    s = str(amount_str).replace(",", "").replace(" ", "")
+
+    match = re.search(r"(\d+(?:\.\d+)?)억원", s)
+    if match:
+        return int(float(match.group(1)) * 100_000_000)
+
+    match = re.search(r"(\d+(?:\.\d+)?)천만원", s)
+    if match:
+        return int(float(match.group(1)) * 10_000_000)
+
+    match = re.search(r"(\d+(?:\.\d+)?)만원", s)
+    if match:
+        return int(float(match.group(1)) * 10_000)
+
+    match = re.search(r"(\d+)원", s)
+    if match:
+        return int(match.group(1))
+
+    return None
+
+
+def _amount_equivalent(gpt_amount, source_text: str) -> bool:
+    """GPT가 낸 금액과 원 단위 값이 같은 금액 표현이 원문에 있는지 확인한다.
+
+    "5,000만원"(GPT)과 "5천만원"(원문)처럼 표기가 달라도 같은 금액(50,000,000원)이면
+    일치로 인정한다. GPT 금액이 원 단위로 환산되지 않는 값(비율 등)이면 항상 False.
+    """
+    target = parse_won_amount(gpt_amount)
+    if target is None:
+        return False
+    return any(
+        parse_won_amount(m.group(0)) == target
+        for m in _WON_AMOUNT_PATTERN.finditer(source_text)
+    )
+
+
 # source_quote 어절 겹침 인정 임계값 (이 비율 이상 어절이 원문에 있으면 인정)
 QUOTE_OVERLAP_THRESHOLD = 0.7
 
@@ -119,7 +169,11 @@ def verify_coverage(coverage: dict, source_text: str) -> dict:
         checks["amount"] = None
         score += 15
     else:
-        amount_hit = _contains(src_norm, str(amount))
+        # 글자 그대로 일치("5천만원")하지 않아도 표기만 다를 뿐 값이 같으면
+        # ("5,000만원" vs "5천만원") 원 단위로 환산해 비교하면 일치로 인정한다.
+        amount_hit = _contains(src_norm, str(amount)) or _amount_equivalent(
+            amount, source_text
+        )
         checks["amount"] = amount_hit
         if amount_hit:
             score += 30

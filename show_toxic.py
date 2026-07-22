@@ -7,3 +7,6 @@ for item in data['toxic_clauses']:
     for c in item['toxic_clauses']:
         print(' ', c['severity'], '-', c['clause_summary'])
         print('  원문:', c['source_quote'][:60])
+        if c.get('exception'):
+            print('  예외:', c['exception'])
+            print('  예외 원문:', (c.get('exception_quote') or '')[:60])
