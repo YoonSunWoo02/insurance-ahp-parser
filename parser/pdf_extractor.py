@@ -167,6 +167,58 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+# 목차(TOC) 항목 판별: 조항 헤더 바로 뒤에 점줄임표(dot leader)로 쪽번호를 이어붙인
+# 목차 항목("51. (예금보험에 따른 지급보장)···········58")은 실제 조항 헤더가 아니다.
+# 이걸 그대로 헤더로 인정하면, 본문에 그 조 번호가 실제로 다시 등장하기 전까지의
+# 모든 텍스트(요약서·유의사항 등 수십 페이지)가 통째로 이 "가짜 조항"의 본문으로
+# 흡수되는 사고가 난다. 실측(프로미라이프 약관)에서 "51."로 시작하는 목차 항목이
+# 뒤이은 요약서 약 27페이지 전체를 통째로 삼켜, 그 안에 있던 무관한 예시 문구까지
+# "제51조 본문"으로 GPT에 전달된 사례를 확인했다. 헤더 바로 뒤에 점(·, ., …)이
+# 5개 이상 반복되다 숫자(쪽번호)로 끝나면 목차 항목으로 보고 헤더 후보에서 제외한다.
+_TOC_DOTLEADER_PATTERN = re.compile(r"^[·.…‥][·.…‥\s]{4,}\d+")
+
+
+def _is_toc_entry(text: str, match: re.Match) -> bool:
+    """이 헤더 매칭이 실제 조항 헤더가 아니라 목차의 점줄임표 항목인지 판단한다."""
+    tail = text[match.end():match.end() + 200]
+    return bool(_TOC_DOTLEADER_PATTERN.match(tail))
+
+
+# "목차처럼 보이는 헤더는 전부 지운다"는 방식(그리고 매칭이 촘촘한 구간을 통째로
+# 지우는 방식)도 시도했으나, 실제로 KB(192→140)·삼성화재(212→212 정상, but 참편한
+# 계열은 169→122 등)에서 정상적인 짧은 조항(여러 특약이 각각 "제4조(준용규정)"로
+# 끝나 조항 간격이 좁아지는 경우 등)까지 목차로 오인해 무더기로 지워버리는 회귀를
+# 실측으로 확인했다. 목차 항목 자체는 원래 무해하다(본문이 짧아 후속 필터에서
+# 자연히 걸러짐) — 문제는 오직 "다음 진짜 헤더가 한참 뒤에야 나와 본문이 거대해지는"
+# 경우뿐이다. 그래서 점줄임표 목차 항목 중에서도 **그 결과 본문이 비정상적으로
+# 커지는 경우만** 골라 제외한다. 이렇게 하면 무해한 목차 잔여물은 손대지 않으면서
+# "51.(예금보험에 따른 지급보장)"이 요약서 27페이지를 통째로 삼키는 것 같은 사고만
+# 막을 수 있다.
+_TOC_RUNAWAY_BODY_SIZE = 3000  # 이보다 큰 본문을 만드는 목차 항목만 제거한다
+
+
+def _drop_toc_noise(matches: list[re.Match], text: str) -> list[re.Match]:
+    """방치하면 본문을 거대하게 삼켜버릴 점줄임표 목차 항목만 매칭 리스트에서 제외한다.
+
+    목차는 보통 "1.(...)" ~ "51.(...)"처럼 여러 줄이 연달아 나오는데, 그중 마지막
+    줄 하나만 제거하면 그 다음으로 가까운 목차 줄이 대신 거대한 본문을 떠안는
+    "두더지 잡기" 현상이 생긴다(실측: 51번을 제외하니 50번이 그 자리를 대신 삼킴).
+    그래서 뒤에서 앞으로 훑으며 "다음까지 살아남는 매칭의 시작 위치"를 기준으로
+    간격을 계산한다 — 목차 줄을 하나 제거해도 그 기준점이 갱신되지 않으므로,
+    같은 목차 블록에 연달아 붙은 목차 줄들이 전부 함께 제거된다.
+    """
+    n = len(matches)
+    keep = [True] * n
+    next_surviving_start = len(text)
+    for i in range(n - 1, -1, -1):
+        m = matches[i]
+        if _is_toc_entry(text, m) and (next_surviving_start - m.end() > _TOC_RUNAWAY_BODY_SIZE):
+            keep[i] = False
+            continue
+        next_surviving_start = m.start()
+    return [m for i, m in enumerate(matches) if keep[i]]
+
+
 def _select_header_matches(text: str) -> list[re.Match]:
     """ARTICLE_PATTERN과 ALT_ARTICLE_PATTERN 매칭 결과 중 실제 조항 헤더로 쓸 것을 고른다.
 
@@ -179,8 +231,8 @@ def _select_header_matches(text: str) -> list[re.Match]:
       3) 그 외(둘 다 적거나 비슷한 규모) → 두 형식이 섞여 쓰였을 수 있으므로,
          primary와 겹치지 않는 alt 매칭만 추가로 병합한다.
     """
-    primary = list(ARTICLE_PATTERN.finditer(text))
-    alt = list(ALT_ARTICLE_PATTERN.finditer(text))
+    primary = _drop_toc_noise(list(ARTICLE_PATTERN.finditer(text)), text)
+    alt = _drop_toc_noise(list(ALT_ARTICLE_PATTERN.finditer(text)), text)
 
     if len(alt) > len(primary):
         return alt
