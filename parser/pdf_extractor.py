@@ -219,6 +219,22 @@ def _drop_toc_noise(matches: list[re.Match], text: str) -> list[re.Match]:
     return [m for i, m in enumerate(matches) if keep[i]]
 
 
+# 본문 중간에서 다른 조항을 인용하는 "30.(보험료의 납입이 연체되는 경우...)에 따라"
+# 같은 참조 텍스트가, PDF 줄바꿈과 우연히 겹쳐 줄 맨 앞에 오면 진짜 새 조항 헤더로
+# 오인식될 수 있다. 헤더 뒤에 조사(에/에서/에도/으로)나 "규정에", "준용", "및",
+# "또는" 같은 인용문 계속 표현이 곧바로 이어지면(새 조항 본문이 시작되는 게 아니라
+# 인용문이 계속되는 것이므로) 헤더 후보에서 제외한다.
+_INLINE_REFERENCE_PATTERN = re.compile(
+    r"^\s*(?:에\s*따라|에\s*따른|에서\s*정한|에\s*의(?:하여|한)|규정에|준용|및\s|또는\s|의\s)"
+)
+
+
+def _is_inline_reference(text: str, match: re.Match) -> bool:
+    """이 헤더 매칭이 새 조항이 아니라, 문장 속에서 다른 조항을 인용하는 참조인지 판단한다."""
+    tail = text[match.end():match.end() + 20]
+    return bool(_INLINE_REFERENCE_PATTERN.match(tail))
+
+
 def _select_header_matches(text: str) -> list[re.Match]:
     """ARTICLE_PATTERN과 ALT_ARTICLE_PATTERN 매칭 결과 중 실제 조항 헤더로 쓸 것을 고른다.
 
@@ -233,6 +249,8 @@ def _select_header_matches(text: str) -> list[re.Match]:
     """
     primary = _drop_toc_noise(list(ARTICLE_PATTERN.finditer(text)), text)
     alt = _drop_toc_noise(list(ALT_ARTICLE_PATTERN.finditer(text)), text)
+    primary = [m for m in primary if not _is_inline_reference(text, m)]
+    alt = [m for m in alt if not _is_inline_reference(text, m)]
 
     if len(alt) > len(primary):
         return alt
@@ -285,10 +303,40 @@ def split_articles(text: str) -> list[Article]:
     return articles
 
 
+# 일부 보험사(예: 무배당 프로미라이프)는 약관을 "제1절 보통약관"과 "제2절 OO특별약관"
+# 으로 명확히 구분해 표기한다. 팀 요청에 따라, 이런 명시적 구분이 있는 문서는 보통약관
+# (주계약)만 분석 대상으로 삼고 그 뒤 특별약관 조항은 제외한다. "제N절" 표기 자체가
+# 없는 보험사(KB·삼성화재 등, 특약을 다른 방식으로 표기함)는 이 패턴이 아예 매칭되지
+# 않으므로 영향이 없다 — 즉 이 문서 특유의 표기 관례에만 좁게 적용되는 규칙이다.
+_SPECIAL_AGREEMENT_SECTION_PATTERN = re.compile(r"제\s*[2-9]\s*절[\s\S]{0,30}특별약관")
+
+
+def _truncate_at_special_agreement_section(text: str) -> str:
+    """"제2절 ... 특별약관" 구분이 있으면 그 지점부터 잘라 보통약관 부분만 남긴다.
+
+    목차에도 "제2절 제도성 특별약관·····63" 처럼 같은 문구가 점줄임표+쪽번호와 함께
+    먼저 나온다. 이건 진짜 구분점이 아니라 목차 줄일 뿐인데, 첫 매칭만 보고 잘라내면
+    본문 전체(목차 뒤에 있는 모든 실제 조항)가 통째로 날아가는 심각한 사고가 난다
+    (실측 확인: 91개 → 20개로 폭락). 점줄임표+쪽번호가 바로 뒤따르는 목차성 매칭은
+    제외하고, 그런 후보가 여러 개면(본문 안에서 재차 언급될 수 있으므로) 문서에서
+    가장 나중에 나오는 것을 진짜 구분점으로 삼는다.
+    """
+    candidates = list(_SPECIAL_AGREEMENT_SECTION_PATTERN.finditer(text))
+    real = [
+        m for m in candidates
+        if not _TOC_DOTLEADER_PATTERN.match(text[m.end():m.end() + 50])
+    ]
+    if not real:
+        return text
+    m = real[-1]
+    return text[: m.start()].rstrip()
+
+
 def extract_articles(pdf_path: str) -> list[Article]:
     """PDF 경로를 받아 텍스트 추출 → 정리 → 조항 분리까지 수행한다."""
     raw = extract_text(pdf_path)
     cleaned = clean_text(raw)
+    cleaned = _truncate_at_special_agreement_section(cleaned)
     return split_articles(cleaned)
 
 

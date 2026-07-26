@@ -16,6 +16,7 @@ GPT 모델/클라이언트는 parser/gpt_classifier.py의 설정을 재사용한
 """
 
 import json
+import re
 import sys
 
 from parser.pdf_extractor import Article
@@ -111,6 +112,15 @@ USER_TEMPLATE = """다음 보험 약관 조항에서 계약자(가입자)에게 
 불리한 내용이 없으면 빈 배열로 답한다.
 원문에 없는 내용은 절대 지어내지 말고, source_quote는 원문을 그대로 인용한다.
 
+매우 중요 — 아무 문장이나 "불리해 보인다"고 뽑지 마라:
+  - "회사가 보상하지 않는 사항은 보장 종목별로 다음과 같습니다"처럼 뒤에 나올
+    목록을 안내만 하는 도입 문장은 그 자체로는 아무 조건도 정하지 않으므로
+    독소조항이 아니다. 실제 면책/제한 "조건"이 명시된 문장만 추출해라.
+  - 지연·불이익의 원인이 계약자/피보험자/보험수익자 본인의 귀책사유(예: 정당한
+    이유 없이 회사의 조사요청에 동의하지 않음, 서류를 제출하지 않음)인 경우는
+    회사가 일방적으로 불리하게 만드는 조항이 아니라 계약자가 스스로 통제할 수
+    있는 사유이므로, 심각도를 "낮음"으로 낮추고 "중간"·"높음"을 주지 마라.
+
 매우 중요 — 예외(단서) 조건도 함께 찾아라:
 "보상하지 않는 사항"류 조항은 "...한 경우. 다만, ~~인 경우에는 보상합니다"처럼
 원칙적으로 불리한 내용(면책) 뒤에 "다만," "단," 등으로 이어지는 예외 문구가 붙어
@@ -181,6 +191,19 @@ source_quote에만 섞어 넣지 말고, exception과 exception_quote 필드에 
 
 반드시 위 스키마의 JSON만 출력하라."""
 
+# 대괄호/괄호로 명사구에 바로 붙은 예외("...[다만, ~]", "...(단, ~)")를 정규식으로
+# 미리 찾아 프롬프트에 힌트로 준다. GPT가 프롬프트 지시만으로는 이 패턴을 놓치는
+# 경우가 있어(실측 확인), 후보를 미리 짚어주면 어느 조건에 붙는 예외인지 GPT가
+# 원문에서 직접 확인해 정확히 매칭할 확률이 높아진다.
+_BRACKET_EXCEPTION_PATTERN = re.compile(
+    r"[\[(](?:다만|단)[,，][^\])]{0,120}[\])]"
+)
+
+
+def _find_bracket_exception_hints(body: str) -> list[str]:
+    """조항 본문에서 대괄호/괄호형 예외 후보를 찾아 원문 그대로 반환한다."""
+    return [m.group(0) for m in _BRACKET_EXCEPTION_PATTERN.finditer(body)]
+
 
 def detect_in_article(article: Article, client=None) -> list[dict]:
     """조항 1개를 GPT로 분석해 독소조항 목록을 반환한다.
@@ -193,6 +216,16 @@ def detect_in_article(article: Article, client=None) -> list[dict]:
         title=article.title or "(제목 없음)",
         body=article.full_text(),
     )
+
+    hints = _find_bracket_exception_hints(article.body)
+    if hints:
+        hint_list = "\n".join(f'  - "{h}"' for h in hints)
+        user_msg += (
+            "\n\n참고 — 이 조항 원문에서 아래와 같은 괄호형 예외 후보가 발견됐다. "
+            "각각 어느 독소조항 바로 뒤에 붙어있는지 원문에서 정확히 확인해서, "
+            "해당하는 독소조항의 exception/exception_quote에 반드시 반영해라 "
+            "(무시하고 null로 두면 안 된다):\n" + hint_list
+        )
 
     try:
         resp = client.chat.completions.create(
