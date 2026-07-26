@@ -6,6 +6,7 @@
 
 import json
 import os
+import re
 import sys
 
 from openai import OpenAI
@@ -125,6 +126,29 @@ def _get_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
+# "주2) 회당 20만원으로 합니다." 처럼 각주 번호로 정의된 금액을 정규식으로 미리 찾아
+# 프롬프트에 "주N) → 금액" 형태의 명확한 매핑으로 힌트를 준다. 본문에는 "외래의
+# 보험가입금액주2)의 한도 내에서 보상"처럼 각주 번호만 나오고 실제 금액은 본문
+# 뒤쪽 각주 정의에 떨어져 있는 경우가 많은데, GPT가 원문 그대로("주2) 회당
+# 20만원으로 합니다.")를 힌트로 줘도 잘 못 찾는 경우가 실측으로 확인돼(예: 상해통원
+# (간편고지) amount가 계속 null로 나옴), 아예 "번호 → 금액"만 뽑아 더 눈에 띄게 준다.
+_FOOTNOTE_AMOUNT_PATTERN = re.compile(
+    r"주\s*(\d+)\)\s*[^\n]{0,40}?(\d[\d,]*\s*(?:억|천만|백만|만)?\s*원|\d+\s*%)"
+)
+
+
+def _find_footnote_amount_hints(body: str) -> list[str]:
+    """조항 본문에서 "주N) → 금액" 형태의 각주 매핑을 찾아 반환한다."""
+    seen: set[str] = set()
+    hints = []
+    for m in _FOOTNOTE_AMOUNT_PATTERN.finditer(body):
+        hint = f"주{m.group(1)}) → {m.group(2)}"
+        if hint not in seen:
+            seen.add(hint)
+            hints.append(hint)
+    return hints
+
+
 def classify_with_gpt(article: Article, client: OpenAI | None = None) -> dict:
     """조항 1개를 GPT로 분석해 보장 정보 dict를 반환한다.
 
@@ -136,6 +160,20 @@ def classify_with_gpt(article: Article, client: OpenAI | None = None) -> dict:
     """
     client = client or _get_client()
     user_msg = USER_TEMPLATE.format(article_text=article.full_text())
+
+    hints = _find_footnote_amount_hints(article.body)
+    if hints:
+        hint_list = "\n".join(f"  {h}" for h in hints)
+        user_msg += (
+            "\n\n★★★ 매우 중요 — 각주 번호-금액 매핑표 ★★★\n"
+            "이 조항 원문을 분석한 결과, 아래 각주 번호는 다음 금액을 의미한다:\n"
+            + hint_list +
+            "\n본문에서 '외래의 보험가입금액주2)의 한도 내에서' 또는 "
+            "'...주2)' 처럼 각주 번호만 등장하고 숫자가 안 보이는 보장 항목이 있으면, "
+            "그 보장의 amount는 반드시 위 매핑표에서 해당 번호에 대응하는 금액으로 채워라. "
+            "amount를 null로 남기기 전에 위 매핑표에 해당 항목의 각주 번호가 있는지 "
+            "반드시 다시 확인해라."
+        )
 
     try:
         resp = client.chat.completions.create(

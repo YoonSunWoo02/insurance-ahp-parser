@@ -240,10 +240,36 @@ def detect_in_article(article: Article, client=None) -> list[dict]:
         )
         content = resp.choices[0].message.content or "{}"
         data = json.loads(content)
-        return data.get("toxic_clauses", []) or []
+        clauses = data.get("toxic_clauses", []) or []
+        for c in clauses:
+            _downgrade_self_fault_severity(c)
+        return clauses
     except Exception as e:  # API 오류/JSON 파싱 오류 모두 포착
         print(f"      → 건너뜀 (오류: {e})", file=sys.stderr)
         return []
+
+
+# 지연·불이익의 원인이 계약자 본인의 귀책사유(정당한 이유 없는 협조 거부, 동의
+# 거부 등)인 경우, 프롬프트 지시만으로는 GPT가 심각도를 낮추라는 지시를 매번
+# 따르지 않는 것이 실측으로 확인돼(예: "계약자 등에게 책임이 있는 사유로 지연"
+# 조항이 계속 "중간"으로 나옴), 코드 레벨에서 확정적으로 하향 조정한다.
+_SELF_FAULT_PATTERN = re.compile(
+    r"(?:계약자|피보험자|보험수익자)[^.]{0,15}책임이\s*있는\s*사유"
+    r"|정당한\s*이유\s*없이"
+    r"|동의(?:하지\s*않|를\s*거부)"
+)
+
+
+def _downgrade_self_fault_severity(clause: dict) -> bool:
+    """지연·불이익의 원인이 계약자 본인 귀책이면 severity를 "낮음"으로 낮춘다.
+
+    반환: 실제로 낮췄으면 True.
+    """
+    text = (clause.get("source_quote") or "") + (clause.get("reason") or "")
+    if clause.get("severity") in ("높음", "중간") and _SELF_FAULT_PATTERN.search(text):
+        clause["severity"] = "낮음"
+        return True
+    return False
 
 
 def _clear_hallucinated_exception(clause: dict, src_norm: str) -> bool:
