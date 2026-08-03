@@ -10,6 +10,11 @@
     2. 정규식으로 보장/금액 후보 조항 1차 분류
     3. GPT로 보장명/금액/지급조건/주계약·특약 구분 JSON 추출
     4. 원문 대조 검증 → 신뢰도 점수(0~100) 부여
+
+가입제안서(가입설계서)류 PDF는 "제N조" 조항 구조가 아니라 표 형식이라 위
+파이프라인이 통하지 않는다. 첫 페이지에 "가입제안서"/"가입설계서" 문구가 있으면
+자동으로 감지해 담보별 보험료/납입기간을 추출하는 별도 경로(parser/proposal_
+extractor.py)로 처리한다 (--premium으로 강제 지정도 가능).
 """
 
 import argparse
@@ -28,6 +33,7 @@ except ImportError:
 from parser.pdf_extractor import extract_articles
 from parser.rule_extractor import filter_candidates, select_candidate_articles
 from parser.gpt_classifier import classify_candidates
+from parser.proposal_extractor import is_proposal_pdf, extract_premium_info
 from validator.verifier import verify_all
 from postprocess import postprocess
 from toxic_detector import detect_toxic_clauses, summarize as summarize_toxic
@@ -63,6 +69,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         action="store_true",
         help="보장 추출 없이 독소조항 탐지만 실행",
     )
+    p.add_argument(
+        "--premium",
+        action="store_true",
+        help="가입제안서(가입설계서) 보험료/납입기간 추출 모드로 강제 실행 "
+        "(생략 시 첫 페이지에서 '가입제안서'/'가입설계서' 문구를 보고 자동 판단)",
+    )
     return p.parse_args(argv)
 
 
@@ -74,16 +86,46 @@ def _run_toxic(articles, result: dict) -> None:
     result["toxic_clauses"] = toxic
 
 
+def run_premium(pdf_path: str) -> dict:
+    """가입제안서(가입설계서) PDF에서 담보별 보험료·전체 보험료·납입기간을 추출한다.
+
+    "약관"과 달리 조항(제N조) 구조가 없는 표 형식 문서라 article 파이프라인이
+    통하지 않는다 — extract_articles()가 헤더를 못 찾아 빈 결과만 나오므로,
+    parser/proposal_extractor.py의 별도 표 추출 경로를 대신 쓴다.
+    """
+    path = Path(pdf_path)
+    print(f"[가입제안서 모드] 보험료/납입기간 추출: {path.name}", file=sys.stderr)
+    info = extract_premium_info(str(path))
+    print(
+        f"      → 담보 {len(info['coverages'])}건, "
+        f"전체 보험료: {info['contract_summary'].get('total_premium')}",
+        file=sys.stderr,
+    )
+    return {
+        "source": path.name,
+        "document_type": "가입제안서",
+        "contract_summary": info["contract_summary"],
+        "coverages": info["coverages"],
+        "error": info["error"],
+    }
+
+
 def run(
     pdf_path: str,
     use_gpt: bool = True,
     detect_toxic: bool = False,
     toxic_only: bool = False,
+    force_premium: bool = False,
 ) -> dict:
     """전체 파이프라인을 실행하고 결과 dict를 반환한다."""
     path = Path(pdf_path)
     if not path.exists():
         raise FileNotFoundError(f"PDF 파일을 찾을 수 없습니다: {pdf_path}")
+
+    # 가입제안서류는 조항 구조가 아니라 표 형식이라 완전히 다른 경로로 처리한다.
+    # --premium으로 강제 지정하지 않아도, 첫 페이지 문구로 자동 감지한다.
+    if force_premium or is_proposal_pdf(str(path)):
+        return run_premium(str(path))
 
     # 1) 추출 + 조항 분리
     print(f"[1/4] PDF 텍스트 추출 및 조항 분리: {path.name}", file=sys.stderr)
@@ -151,6 +193,7 @@ def main(argv=None) -> int:
             use_gpt=not args.no_gpt,
             detect_toxic=args.toxic,
             toxic_only=args.toxic_only,
+            force_premium=args.premium,
         )
     except Exception as e:
         print(f"오류: {e}", file=sys.stderr)
@@ -165,15 +208,21 @@ def main(argv=None) -> int:
     parsed_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(args.pdf).stem
 
-    # 독소조항은 별도 파일(PDF이름_toxic.json)로 분리 저장
-    toxic_keys = ("toxic_summary", "toxic_clauses")
-    has_toxic = any(k in result for k in toxic_keys)
-
     def _save(path: Path, data: dict) -> None:
         path.write_text(
             json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         print(f"결과 저장: {path}", file=sys.stderr)
+
+    # 가입제안서 모드: 조항/독소조항 개념이 없으므로 _premium.json 하나만 저장
+    if result.get("document_type") == "가입제안서":
+        premium_path = Path(args.out) if args.out else parsed_dir / f"{stem}_premium.json"
+        _save(premium_path, result)
+        return 0
+
+    # 독소조항은 별도 파일(PDF이름_toxic.json)로 분리 저장
+    toxic_keys = ("toxic_summary", "toxic_clauses")
+    has_toxic = any(k in result for k in toxic_keys)
 
     if args.toxic_only:
         # 독소조항만: _toxic.json 하나만 저장 (--out 지정 시 그 경로 사용)
