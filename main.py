@@ -12,9 +12,9 @@
     4. 원문 대조 검증 → 신뢰도 점수(0~100) 부여
 
 가입제안서(가입설계서)류 PDF는 "제N조" 조항 구조가 아니라 표 형식이라 위
-파이프라인이 통하지 않는다. 첫 페이지에 "가입제안서"/"가입설계서" 문구가 있으면
-자동으로 감지해 담보별 보험료/납입기간을 추출하는 별도 경로(parser/proposal_
-extractor.py)로 처리한다 (--premium으로 강제 지정도 가능).
+파이프라인이 통하지 않는다. 첫 페이지에 "가입제안서"/"가입설계서"/"상품설명서
+(제안용)" 문구가 있으면 자동으로 감지해 담보별 보험료/납입기간을 추출하는
+별도 경로(parser/proposal_extractor.py)로 처리한다 (--premium으로 강제 지정도 가능).
 """
 
 import argparse
@@ -33,7 +33,15 @@ except ImportError:
 from parser.pdf_extractor import extract_articles
 from parser.rule_extractor import filter_candidates, select_candidate_articles
 from parser.gpt_classifier import classify_candidates
-from parser.proposal_extractor import is_proposal_pdf, extract_premium_info
+from parser.proposal_extractor import (
+    extract_premium_info,
+    find_insured_age,
+    find_insured_gender,
+    find_insured_job,
+    is_proposal_pdf,
+    to_unified_format,
+)
+from parser.amount_structurer import structure_all_amounts
 from validator.verifier import verify_all
 from postprocess import postprocess
 from toxic_detector import detect_toxic_clauses, summarize as summarize_toxic
@@ -101,13 +109,14 @@ def run_premium(pdf_path: str) -> dict:
         f"전체 보험료: {info['contract_summary'].get('total_premium')}",
         file=sys.stderr,
     )
-    return {
-        "source": path.name,
-        "document_type": "가입제안서",
-        "contract_summary": info["contract_summary"],
-        "coverages": info["coverages"],
-        "error": info["error"],
-    }
+    # 가입화면(_screen.json)과 같은 팀 공통 양식으로 내보낸다.
+    return to_unified_format(
+        info,
+        path.name,
+        find_insured_age(str(path)),
+        gender=find_insured_gender(str(path)),
+        job=find_insured_job(str(path)),
+    )
 
 
 def run(
@@ -170,6 +179,9 @@ def run(
 
     # 저신뢰 금액 무효화 + null 금액 채움 + 동일 보장 중복 제거 (JSON에도 반영)
     postprocess(verified)
+
+    # amount 문자열이 확정된 뒤 마지막 단계로 회당/연간/공제금액/횟수한도 구조로 변환
+    structure_all_amounts(verified)
 
     total_cov = sum(len(v["coverages"]) for v in verified)
     result = {

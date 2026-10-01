@@ -30,3 +30,10 @@ data/raw_pdfs/*.pdf
 Thumbs.db
 .idea/
 .vscode/
+
+# ── 가입화면 스크린샷 원본/파싱 결과, 백업 (대용량·개인정보) ──
+data/images/
+data/images_new/
+data/image_results/
+data/result_json/
+data/*_backup_*/

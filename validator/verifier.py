@@ -50,6 +50,10 @@ def parse_won_amount(amount_str) -> int | None:
     if match:
         return int(float(match.group(1)) * 10_000_000)
 
+    match = re.search(r"(\d+(?:\.\d+)?)백만원", s)
+    if match:
+        return int(float(match.group(1)) * 1_000_000)
+
     match = re.search(r"(\d+(?:\.\d+)?)만원", s)
     if match:
         return int(float(match.group(1)) * 10_000)
